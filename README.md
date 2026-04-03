@@ -1,2 +1,12 @@
-# StokesianDynamics
-a fast library for applying lubrication corrections at the level of forces and torques
+make the environment with 
+```
+conda env create -f environment.yml
+```
+then activate with
+```
+conda activate lubrication
+```
+then install with
+```
+pip install .
+```

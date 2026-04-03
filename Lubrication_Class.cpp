@@ -1,0 +1,588 @@
+#include <iostream>
+#include <fstream>
+#include <utility> 
+#include <vector>
+#include <sstream>
+#include <string>
+#include <iomanip>
+#include <Eigen/Dense>  
+
+#include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
+#include <nanobind/stl/vector.h>
+#include <nanobind/stl/string.h>
+
+namespace nb = nanobind;
+
+// double typedefs
+typedef Eigen::MatrixXd Matrix;
+
+// rigid types
+typedef Eigen::Vector3d Vector3;
+typedef Eigen::Matrix3d Matrix3;
+
+// Convenience type aliases for nanobind arrays
+using nb_array_d = nb::ndarray<double, nb::ndim<1>, nb::c_contig>;
+using nb_array_i = nb::ndarray<int,    nb::ndim<1>, nb::c_contig>;
+
+
+class Lubrication
+{
+  private:
+  void SetMemberData(std::string fname, std::vector< std::vector<double> >& vec_11, std::vector< std::vector<double> >& vec_12, std::vector<double>& x);
+  void SetMemberDataWall(std::string fname, std::vector< std::vector<double> >& vec, std::vector<double>& x, bool reverse);
+  std::vector< std::vector<double> > mob_scalars_WS_11, mob_scalars_WS_12;
+  std::vector<double> WS_x;
+  std::vector< std::vector<double> > mob_scalars_JO_11, mob_scalars_JO_12;
+  std::vector<double> JO_x;
+  std::vector< std::vector<double> > mob_scalars_MB_11, mob_scalars_MB_12;
+  std::vector<double> MB_x;
+  std::vector< std::vector<double> > mob_scalars_wall_2562;
+  std::vector<double> Wall_2562_x;
+  std::vector< std::vector<double> > mob_scalars_wall_MB;
+  std::vector<double> Wall_MB_x;
+  int FindNearestIndexLower(double r_norm, std::vector<double>& x);
+  double LinearInterp(double r_norm, double xL, double xR, double yL, double yR);
+  void ResistMatrix(double r_norm, double mob_factor[3], Vector3 r_hat, Matrix& R, bool inv, std::vector<double>& x, const std::vector< std::vector<double> >& vec_11, const std::vector< std::vector<double> >& vec_12);
+  void ATResistMatrix(double r_norm, double mob_factor[3], Vector3 r_hat, Matrix& R);
+  Matrix WallResistMatrix(double r_norm, double mob_factor[3], std::vector< double >& x, const std::vector< std::vector< double > >& vec);
+  Matrix ResistPairSup(double r_norm, double mob_factor[3], Vector3 r_hat);
+  Matrix WallResistMatrixMB(double r_norm, double mob_factor[3], std::vector< double >& x, const std::vector< std::vector< double > >& vec);
+  Matrix ResistPairMB(double r_norm, double mob_factor[3], Vector3 r_hat);
+
+  public:
+  void ResistPairSup_py(double r_norm, double a, double eta, nb_array_d r_hat);
+  void ResistCOO(nb::list r_vectors, nb::list n_list, double a, double eta, double cutoff, double wall_cutoff, nb_array_d periodic_length, bool Sup_if_true, nb::list data, nb::list rows, nb::list cols);
+  void ResistCOO_wall(nb::list r_vectors, double a, double eta, double wall_cutoff, nb_array_d periodic_length, bool Sup_if_true, nb::list data, nb::list rows, nb::list cols);
+  double debye_cut;
+  Lubrication(double d_cut);
+};
+
+
+Lubrication::Lubrication(double d_cut)
+{
+  debye_cut = d_cut;
+  std::string base_dir = __FILENAME__;
+  SetMemberData(base_dir+"/Resistance_Coefs/mob_scalars_WS.txt",         mob_scalars_WS_11, mob_scalars_WS_12, WS_x);
+  SetMemberData(base_dir+"/Resistance_Coefs/res_scalars_JO.txt",         mob_scalars_JO_11, mob_scalars_JO_12, JO_x);
+  SetMemberDataWall(base_dir+"/Resistance_Coefs/mob_scalars_wall_MB_2562_eig_thresh.txt", mob_scalars_wall_2562, Wall_2562_x, true);
+  SetMemberData(base_dir+"/Resistance_Coefs/res_scalars_MB_1.txt",       mob_scalars_MB_11, mob_scalars_MB_12, MB_x);
+  SetMemberDataWall(base_dir+"/Resistance_Coefs/res_scalars_wall_MB.txt",mob_scalars_wall_MB, Wall_MB_x, false);
+}
+
+
+void Lubrication::SetMemberData(std::string fname, std::vector< std::vector<double> >& vec_11, std::vector< std::vector<double> >& vec_12, std::vector<double>& x)
+{ 
+  std::ifstream ifs(fname);
+  double tempval;
+  std::vector<double> tempv;
+  
+  if (!ifs.fail())
+  {
+    int p = 0;
+    int c = -1;
+    while(!ifs.eof())
+    {
+      c++;
+      ifs >> tempval;
+      tempv.push_back(tempval);
+      if(c == 5)
+      {
+        p++;
+        c = -1;
+        if(p % 2){ vec_11.push_back(tempv); }
+        else      { vec_12.push_back(tempv); }
+        tempv.clear();
+      }
+    }
+    ifs.close();
+  }
+  for (auto row : vec_11)
+    x.push_back(row[0]);
+}
+
+
+void Lubrication::SetMemberDataWall(std::string fname, std::vector< std::vector<double> >& vec, std::vector<double>& x, bool reverse)
+{ 
+  std::ifstream ifs(fname);
+  double tempval;
+  std::vector<double> tempv;
+  
+  if (!ifs.fail())
+  {
+    int c = -1;
+    while(!ifs.eof())
+    {
+      c++;
+      ifs >> tempval;
+      tempv.push_back(tempval);
+      if(c == 5)
+      {
+        c = -1;
+        if(reverse) { vec.insert(vec.begin(), tempv); }
+        else        { vec.push_back(tempv); }
+        tempv.clear();
+      }
+    }
+    ifs.close();
+  }
+  for (auto row : vec)
+    x.push_back(row[0]);
+}
+
+
+int Lubrication::FindNearestIndexLower(double r_norm, std::vector<double>& x)
+{
+    std::vector<double>::iterator before;
+    before = std::lower_bound(x.begin(), x.end(), r_norm);
+    if(before == x.begin()) { return -1; }
+    if(before == x.end())   { return (int)x.size()-1; }
+    --before;
+    return (int)std::distance(x.begin(), before);
+}
+
+
+double Lubrication::LinearInterp(double r_norm, double xL, double xR, double yL, double yR)
+{
+    if(r_norm < xL || r_norm > xR){ std::cout << "error in linear interp." << std::endl; return 1e100; }
+    double dydx = ( yR - yL ) / ( xR - xL ); 
+    return yL + dydx * ( r_norm - xL ); 
+}
+
+
+void Lubrication::ResistMatrix(double r_norm, double mob_factor[3], Vector3 r_hat, Matrix& R, bool inv,
+                               std::vector<double>& x,
+                               const std::vector< std::vector<double> >& vec_11,
+                               const std::vector< std::vector<double> >& vec_12)
+{
+    double X11A, Y11A, Y11B, X11C, Y11C; 
+    double X12A, Y12A, Y12B, X12C, Y12C;
+    
+    int Ind = FindNearestIndexLower(r_norm, x);
+    
+    if(Ind == -1 || Ind == (int)x.size()-1)
+    {
+      int edge = (Ind == -1) ? 0 : ((int)x.size()-1);
+      X11A = vec_11[edge][1]; Y11A = vec_11[edge][2]; Y11B = vec_11[edge][3];
+      X11C = vec_11[edge][4]; Y11C = vec_11[edge][5]; 
+      X12A = vec_12[edge][1]; Y12A = vec_12[edge][2]; Y12B = vec_12[edge][3];
+      X12C = vec_12[edge][4]; Y12C = vec_12[edge][5];
+    }
+    else
+    {
+      double a_11[5], a_12[5];
+      double xL = x[Ind], xR = x[Ind+1];
+      for(int i = 0; i < 5; i++){
+        a_11[i] = LinearInterp(r_norm, xL, xR, vec_11[Ind][i+1], vec_11[Ind+1][i+1]);
+        a_12[i] = LinearInterp(r_norm, xL, xR, vec_12[Ind][i+1], vec_12[Ind+1][i+1]);
+      }
+      X11A = a_11[0]; Y11A = a_11[1]; Y11B = a_11[2]; X11C = a_11[3]; Y11C = a_11[4]; 
+      X12A = a_12[0]; Y12A = a_12[1]; Y12B = a_12[2]; X12C = a_12[3]; Y12C = a_12[4];
+    }
+    
+    Matrix3 squeezeMat = r_hat * r_hat.transpose();
+    Matrix3 Eye = Matrix3::Identity();
+    Matrix3 shearMat = Eye - squeezeMat;
+    Matrix3 vortMat;
+    vortMat <<  0.0,       r_hat[2], -r_hat[1],
+               -r_hat[2],  0.0,       r_hat[0],
+                r_hat[1], -r_hat[0],  0.0;
+    vortMat *= -1;
+	       
+    R.block<3,3>(0,0) = mob_factor[0]*(X11A*squeezeMat + Y11A*shearMat);
+    R.block<3,3>(0,3) = -mob_factor[1]*(Y11B*vortMat);
+    R.block<3,3>(0,6) = mob_factor[0]*(X12A*squeezeMat + Y12A*shearMat);
+    R.block<3,3>(0,9) = mob_factor[1]*(Y12B*vortMat); 
+    R.block<3,3>(3,0) = mob_factor[1]*(Y11B*vortMat);
+    R.block<3,3>(3,3) = mob_factor[2]*(X11C*squeezeMat + Y11C*shearMat);
+    R.block<3,3>(3,6) = mob_factor[1]*(Y12B*vortMat);
+    R.block<3,3>(3,9) = mob_factor[2]*(X12C*squeezeMat + Y12C*shearMat);
+    R.block<3,3>(6,0) = mob_factor[0]*(X12A*squeezeMat + Y12A*shearMat);
+    R.block<3,3>(6,3) = -mob_factor[1]*(Y12B*vortMat);
+    R.block<3,3>(6,6) = mob_factor[0]*(X11A*squeezeMat + Y11A*shearMat);
+    R.block<3,3>(6,9) = mob_factor[1]*(Y11B*vortMat);
+    R.block<3,3>(9,0) = -mob_factor[1]*(Y12B*vortMat);
+    R.block<3,3>(9,3) = mob_factor[2]*(X12C*squeezeMat + Y12C*shearMat);
+    R.block<3,3>(9,6) = -mob_factor[1]*(Y11B*vortMat);
+    R.block<3,3>(9,9) = mob_factor[2]*(X11C*squeezeMat + Y11C*shearMat);
+    
+    if(inv){ R = R.inverse(); }
+}
+
+
+void Lubrication::ATResistMatrix(double r_norm, double mob_factor[3], Vector3 r_hat, Matrix& R)
+{
+    double epsilon = r_norm - 2.0;
+
+    double X11A = 0.995419E0+(0.25E0)*(1.0/epsilon)+(0.225E0)*log((1.0/epsilon))+(0.267857E-1)*epsilon*log((1.0/epsilon));
+    double X12A = (-0.350153E0)+(-0.25E0)*(1.0/epsilon)+(-0.225E0)*log((1.0/epsilon))+(-0.267857E-1)*epsilon*log((1.0/epsilon));
+    double Y11A = 0.998317E0+(0.166667E0)*log((1.0/epsilon));
+    double Y12A = (-0.273652E0)+(-0.166667E0)*log((1.0/epsilon));
+    double Y11B = (-0.666667E0)*(0.23892E0+(-0.25E0)*log((1.0/epsilon))+(-0.125E0)*epsilon*log((1.0/epsilon)));
+    double Y12B = (-0.666667E0)*((-0.162268E-2)+(0.25E0)*log((1.0/epsilon))+(0.125E0)*epsilon*log((1.0/epsilon)));
+    double X11C = 0.133333E1*(0.10518E1+(-0.125E0)*epsilon*log((1.0/epsilon)));
+    double X12C = 0.133333E1*((-0.150257E0)+(0.125E0)*epsilon*log((1.0/epsilon)));
+    double Y11C = 0.133333E1*(0.702834E0+(0.2E0)*log((1.0/epsilon))+(0.188E0)*epsilon*log((1.0/epsilon)));
+    double Y12C = 0.133333E1*((-0.27464E-1)+(0.5E-1)*log((1.0/epsilon))+(0.62E-1)*epsilon*log((1.0/epsilon)));
+    
+    Matrix3 squeezeMat = r_hat * r_hat.transpose();
+    Matrix3 Eye = Matrix3::Identity();
+    Matrix3 shearMat = Eye - squeezeMat;
+    Matrix3 vortMat;
+    vortMat <<  0.0,       r_hat[2], -r_hat[1],
+               -r_hat[2],  0.0,       r_hat[0],
+                r_hat[1], -r_hat[0],  0.0;
+    vortMat *= -1;
+	       
+    R.block<3,3>(0,0) = mob_factor[0]*(X11A*squeezeMat + Y11A*shearMat);
+    R.block<3,3>(0,3) = -mob_factor[1]*(Y11B*vortMat);
+    R.block<3,3>(0,6) = mob_factor[0]*(X12A*squeezeMat + Y12A*shearMat);
+    R.block<3,3>(0,9) = mob_factor[1]*(Y12B*vortMat); 
+    R.block<3,3>(3,0) = mob_factor[1]*(Y11B*vortMat);
+    R.block<3,3>(3,3) = mob_factor[2]*(X11C*squeezeMat + Y11C*shearMat);
+    R.block<3,3>(3,6) = mob_factor[1]*(Y12B*vortMat);
+    R.block<3,3>(3,9) = mob_factor[2]*(X12C*squeezeMat + Y12C*shearMat);
+    R.block<3,3>(6,0) = mob_factor[0]*(X12A*squeezeMat + Y12A*shearMat);
+    R.block<3,3>(6,3) = -mob_factor[1]*(Y12B*vortMat);
+    R.block<3,3>(6,6) = mob_factor[0]*(X11A*squeezeMat + Y11A*shearMat);
+    R.block<3,3>(6,9) = mob_factor[1]*(Y11B*vortMat);
+    R.block<3,3>(9,0) = -mob_factor[1]*(Y12B*vortMat);
+    R.block<3,3>(9,3) = mob_factor[2]*(X12C*squeezeMat + Y12C*shearMat);
+    R.block<3,3>(9,6) = -mob_factor[1]*(Y11B*vortMat);
+    R.block<3,3>(9,9) = mob_factor[2]*(X11C*squeezeMat + Y11C*shearMat);
+}
+
+
+Matrix Lubrication::WallResistMatrix(double r_norm, double mob_factor[3],
+                                     std::vector<double>& x,
+                                     const std::vector< std::vector<double> >& vec)
+{
+    double Xa, Ya, Yb, Xc, Yc; 
+    double epsilon = r_norm - 1.0;
+    double tanh_fact = 1.0;
+
+    if(epsilon < debye_cut)
+    {
+      epsilon = debye_cut;
+      r_norm  = 1.0 + epsilon;
+    }
+      
+    int Ind = FindNearestIndexLower(r_norm, x);
+    if(Ind == -1)
+    {
+      Xa = vec[0][1]; Ya = vec[0][2]; Yb = vec[0][3]; Xc = vec[0][4]; Yc = vec[0][5]; 
+    }
+    else if(Ind == (int)x.size()-1)
+    {
+      Xa = 1.0-(9.0/8.0)*(1.0/r_norm);
+      Ya = 1.0-(9.0/16.0)*(1.0/r_norm);
+      Yb = 0.0; Xc = 0.75; Yc = 0.75;
+    }
+    else
+    {
+      double a[5], xL = x[Ind], xR = x[Ind+1];
+      for(int i = 0; i < 5; i++)
+        a[i] = LinearInterp(r_norm, xL, xR, vec[Ind][i+1], vec[Ind+1][i+1]);
+      Xa = a[0]; Ya = a[1]; Yb = a[2]; Xc = a[3]; Yc = a[4]; 
+    }
+    
+    double Xa_asym = 1.0/epsilon - (1.0/5.0)*log(epsilon) + 0.971280;
+    double Ya_asym = -(8.0/15.0)*log(epsilon) + 0.9588;
+    double Yb_asym = (4./3.)*(-(-(1.0/10.0)*log(epsilon)-0.1895) - 0.4576*epsilon);
+    double Xc_asym = (4./3.)*(1.2020569 - 3.0*(M_PI*M_PI/6.0-1.0)*epsilon);
+    double Yc_asym = (4./3.)*(-2.0/5.0*log(epsilon) + 0.3817 + 1.4578*epsilon);
+
+    double denom = Ya*Yc - Yb*Yb;
+    double RXa = 1.0/Xa, RYa = Yc/denom, RYb = -Yb/denom;
+    double RXc = 1.0/Xc, RYc = Ya/denom; 
+    
+    Xa = (r_norm > 1.1)   ? RXa : Xa_asym;
+    Ya = (r_norm > 1.01)  ? RYa : Ya_asym;
+    Yb = (r_norm > 1.1)   ? RYb : Yb_asym;
+    Xc = (r_norm > 1.01)  ? RXc : Xc_asym;
+    Yc = (r_norm > 1.1)   ? RYc : Yc_asym;
+    
+    double XcPlus = fmax((Xc - 4.0/3.0), 0.0);
+    double YcPlus = fmax((Yc - 4.0/3.0), 0.0);
+    
+    Matrix R(6,6);
+    R << mob_factor[0]*(Ya-1.), 0, 0, 0,  mob_factor[1]*Yb,  0,
+         0, mob_factor[0]*(Ya-1.), 0, -mob_factor[1]*Yb, 0,  0,
+         0, 0, mob_factor[0]*(Xa-1.), 0,  0,  0,
+         0, -mob_factor[1]*Yb, 0,  mob_factor[2]*YcPlus, 0,  0,
+         mob_factor[1]*Yb, 0, 0, 0, mob_factor[2]*YcPlus,    0,
+         0, 0, 0, 0, 0, mob_factor[2]*XcPlus;
+
+    if(fabs(tanh_fact-1.0) > 1e-10){ R *= tanh_fact; }
+    return R;
+}
+
+
+Matrix Lubrication::WallResistMatrixMB(double r_norm, double mob_factor[3],
+                                       std::vector<double>& x,
+                                       const std::vector< std::vector<double> >& vec)
+{
+    double Xa, Ya, Yb, Xc, Yc; 
+    double epsilon = r_norm - 1.0;
+    double tanh_fact = 1.0;
+
+    if(epsilon < debye_cut)
+    {
+      epsilon = debye_cut;
+      r_norm  = 1.0 + epsilon;
+    }
+      
+    int Ind = FindNearestIndexLower(r_norm, x);
+    if(Ind == -1)
+    {
+      Xa = vec[0][1]; Ya = vec[0][2]; Yb = vec[0][3]; Xc = vec[0][4]; Yc = vec[0][5]; 
+    }
+    else if(Ind == (int)x.size()-1)
+    {
+      Xa = 1.0/(1.0-(9.0/8.0)*(1.0/r_norm));
+      Ya = 1.0/(1.0-(9.0/16.0)*(1.0/r_norm));
+      Yb = 0.0; Xc = 1.0/0.75; Yc = 1.0/0.75;
+    }
+    else
+    {
+      double a[5], xL = x[Ind], xR = x[Ind+1];
+      for(int i = 0; i < 5; i++)
+        a[i] = LinearInterp(r_norm, xL, xR, vec[Ind][i+1], vec[Ind+1][i+1]);
+      Xa = a[0]; Ya = a[1]; Yb = a[2]; Xc = a[3]; Yc = a[4]; 
+    }
+    
+    Matrix R(6,6);
+    R << mob_factor[0]*(Ya-1.), 0, 0, 0,  mob_factor[1]*Yb,  0,
+         0, mob_factor[0]*(Ya-1.), 0, -mob_factor[1]*Yb, 0,  0,
+         0, 0, mob_factor[0]*(Xa-1.), 0,  0,  0,
+         0, -mob_factor[1]*Yb, 0,  mob_factor[2]*(Yc-4.0/3.0), 0, 0,
+         mob_factor[1]*Yb, 0, 0, 0, mob_factor[2]*(Yc-4.0/3.0), 0,
+         0, 0, 0, 0, 0, mob_factor[2]*(Xc-4.0/3.0);
+
+    if(fabs(tanh_fact-1.0) > 1e-10){ R *= tanh_fact; }
+    return R;
+}
+
+
+Matrix Lubrication::ResistPairSup(double r_norm, double mob_factor[3], Vector3 r_hat)
+{
+    double AT_cutoff = (2.0 + 0.006 - 1e-8);
+    double WS_cutoff = (2.0 + 0.1   + 1e-8);
+    bool inv;
+    double res_factor[3] = {1.0/mob_factor[0], 1.0/mob_factor[1], 1.0/mob_factor[2]};
+    Matrix R(12,12);
+    
+    double epsilon = r_norm - 2.0;
+    double tanh_fact = 1.0;
+    if(epsilon < debye_cut)
+    {
+      epsilon = debye_cut;
+      r_norm  = epsilon + 2.0;
+    }
+    
+    if(r_norm <= AT_cutoff)
+    {
+      ATResistMatrix(r_norm, mob_factor, r_hat, R);
+    }
+    else if(r_norm <= WS_cutoff)
+    {
+      inv = true;
+      ResistMatrix(r_norm, res_factor, r_hat, R, inv, WS_x, mob_scalars_WS_11, mob_scalars_WS_12);
+    }
+    else
+    {
+      inv = false;
+      ResistMatrix(r_norm, mob_factor, r_hat, R, inv, JO_x, mob_scalars_JO_11, mob_scalars_JO_12);
+    }
+    
+    if(fabs(tanh_fact-1.0) > 1e-10){ R *= tanh_fact; }
+    return R;
+}
+
+
+Matrix Lubrication::ResistPairMB(double r_norm, double mob_factor[3], Vector3 r_hat)
+{
+    bool inv = false;
+    Matrix R(12,12);
+    
+    double epsilon = r_norm - 2.0;
+    double tanh_fact = 1.0;
+    if(epsilon < debye_cut)
+    {
+      epsilon = debye_cut;
+      r_norm  = epsilon + 2.0;
+    }
+    
+    ResistMatrix(r_norm, mob_factor, r_hat, R, inv, MB_x, mob_scalars_MB_11, mob_scalars_MB_12);
+    if(fabs(tanh_fact-1.0) > 1e-10){ R *= tanh_fact; }
+    return R;
+}
+
+
+void Lubrication::ResistPairSup_py(double r_norm, double a, double eta, nb_array_d r_hat)
+{
+    Vector3 r_hat_E;
+    r_hat_E << r_hat(0), r_hat(1), r_hat(2);
+    double mob_factor[3] = {6.0*M_PI*eta*a, 6.0*M_PI*eta*a*a, 6.0*M_PI*eta*a*a*a};
+    Matrix R = ResistPairSup(r_norm, mob_factor, r_hat_E);
+    std::cout << "[" << mob_factor[0] << " " << mob_factor[1] << " " << mob_factor[2] << "]\n";
+    std::cout << "[" << r_hat_E[0]   << " " << r_hat_E[1]   << " " << r_hat_E[2]   << "]\n";
+    std::cout << r_norm << "\n" << R << "\n";
+}
+
+
+void Lubrication::ResistCOO(nb::list r_vectors, nb::list n_list,
+                             double a, double eta, double cutoff, double wall_cutoff,
+                             nb_array_d periodic_length, bool Sup_if_true,
+                             nb::list data, nb::list rows, nb::list cols)
+{
+  int num_bodies = (int)r_vectors.size();
+  double mob_factor[3] = {6.0*M_PI*eta*a, 6.0*M_PI*eta*a*a, 6.0*M_PI*eta*a*a*a};
+  Vector3 r_jk, r_hat;
+  double r_norm, height;
+  Matrix R_pair, R_wall;
+  double R_val;
+  const double m_eps = 1e-12;
+  
+  for(int j = 0; j < num_bodies; j++)
+  {
+    // Extract r_j as a nanobind double array
+    nb_array_d r_j = nb::cast<nb_array_d>(r_vectors[j]);
+    height = r_j(2) / a;
+    
+    if(height < wall_cutoff)
+    {
+      if(Sup_if_true)
+        R_wall = WallResistMatrix(height,   mob_factor, Wall_2562_x, mob_scalars_wall_2562);
+      else
+        R_wall = WallResistMatrixMB(height, mob_factor, Wall_MB_x,   mob_scalars_wall_MB);
+
+      for(int row = 0; row < 6; row++)
+        for(int col = 0; col < 6; col++)
+        {
+          R_val = R_wall(row, col);
+          if(fabs(R_val) > m_eps)
+          {
+            data.append(R_val);
+            rows.append(row + j*6);
+            cols.append(col + j*6);
+          }
+        }
+    }
+    
+    nb_array_i neighbors = nb::cast<nb_array_i>(n_list[j]);
+    int num_neighbors    = (int)neighbors.size();
+    if(num_neighbors == 0){ continue; }
+    
+    for(int k_ind = 0; k_ind < num_neighbors; k_ind++)
+    {
+      int k = neighbors(k_ind);
+      nb_array_d r_k = nb::cast<nb_array_d>(r_vectors[k]);
+
+      for(int l = 0; l < 3; ++l)
+      {
+        r_jk[l] = r_j(l) - r_k(l);
+        if(periodic_length(l) > 0)
+        {
+          double Ll = periodic_length(l);
+          r_jk[l] -= (int)(r_jk[l]/Ll + 0.5*(int(r_jk[l]>0) - int(r_jk[l]<0))) * Ll;
+          r_jk[l] /= a;
+        }
+      }
+      r_norm = r_jk.norm();
+      r_hat  = -r_jk / r_norm;   // negative sign preserved
+      
+      if(r_norm < cutoff)
+      {
+        if(Sup_if_true)
+          R_pair = ResistPairSup(r_norm, mob_factor, r_hat);
+        else
+          R_pair = ResistPairMB(r_norm, mob_factor, r_hat);
+
+        Matrix R_pair_jj = R_pair.block<6,6>(0,0);
+        Matrix R_pair_kk = R_pair.block<6,6>(6,6);
+        Matrix R_pair_jk = R_pair.block<6,6>(0,6);
+        Matrix R_pair_kj = R_pair.block<6,6>(6,0);
+        
+        for(int row = 0; row < 6; row++)
+          for(int col = 0; col < 6; col++)
+          {
+            // jj block
+            R_val = R_pair_jj(row,col);
+            if(fabs(R_val) > m_eps){ data.append(R_val); rows.append(row+j*6); cols.append(col+j*6); }
+            // kk block
+            R_val = R_pair_kk(row,col);
+            if(fabs(R_val) > m_eps){ data.append(R_val); rows.append(row+k*6); cols.append(col+k*6); }
+            // jk block
+            R_val = R_pair_jk(row,col);
+            if(fabs(R_val) > m_eps){ data.append(R_val); rows.append(row+j*6); cols.append(col+k*6); }
+            // kj block
+            R_val = R_pair_kj(row,col);
+            if(fabs(R_val) > m_eps){ data.append(R_val); rows.append(row+k*6); cols.append(col+j*6); }
+          }
+      }
+    }
+  }
+}
+
+
+void Lubrication::ResistCOO_wall(nb::list r_vectors,
+                                  double a, double eta, double wall_cutoff,
+                                  nb_array_d periodic_length, bool Sup_if_true,
+                                  nb::list data, nb::list rows, nb::list cols)
+{
+  int num_bodies = (int)r_vectors.size();
+  double mob_factor[3] = {6.0*M_PI*eta*a, 6.0*M_PI*eta*a*a, 6.0*M_PI*eta*a*a*a};
+  Matrix R_wall;
+  double R_val;
+  const double m_eps = 1e-12;
+  
+  for(int j = 0; j < num_bodies; j++)
+  {
+    nb_array_d r_j = nb::cast<nb_array_d>(r_vectors[j]);
+    double height  = r_j(2) / a;
+    
+    if(height < wall_cutoff){ continue; }
+    
+    if(Sup_if_true)
+      R_wall = WallResistMatrix(height,   mob_factor, Wall_2562_x, mob_scalars_wall_2562);
+    else
+      R_wall = WallResistMatrixMB(height, mob_factor, Wall_MB_x,   mob_scalars_wall_MB);
+
+    for(int row = 0; row < 6; row++)
+      for(int col = 0; col < 6; col++)
+      {
+        R_val = R_wall(row, col);
+        if(fabs(R_val) > m_eps)
+        {
+          data.append(R_val);
+          rows.append(row + j*6);
+          cols.append(col + j*6);
+        }
+      }
+  }
+}
+
+
+// =============================================================================
+// nanobind module definition
+// =============================================================================
+using namespace nanobind::literals;
+
+NB_MODULE(Lubrication_Class, m) {
+  m.doc() = "Lubrication class — nanobind wrapper";
+
+  nb::class_<Lubrication>(m, "Lubrication")
+    .def(nb::init<double>(),
+         "d_cut"_a,
+         "Construct Lubrication with a Debye cutoff distance.")
+    .def("ResistCOO",      &Lubrication::ResistCOO,
+         "r_vectors"_a, "n_list"_a, "a"_a, "eta"_a,
+         "cutoff"_a, "wall_cutoff"_a, "periodic_length"_a,
+         "Sup_if_true"_a, "data"_a, "rows"_a, "cols"_a)
+    .def("ResistCOO_wall", &Lubrication::ResistCOO_wall,
+         "r_vectors"_a, "a"_a, "eta"_a, "wall_cutoff"_a,
+         "periodic_length"_a, "Sup_if_true"_a, "data"_a, "rows"_a, "cols"_a)
+    .def("ResistPairSup_py", &Lubrication::ResistPairSup_py,
+         "r_norm"_a, "a"_a, "eta"_a, "r_hat"_a);
+}

@@ -1,0 +1,30 @@
+name: lubrication
+channels:
+  - conda-forge
+dependencies:
+  # Core numerics
+  - numpy
+  - scipy
+  - matplotlib
+  - libMobility
+
+  # JIT compilation for Python numerical kernels
+  - numba
+
+  # Build tools
+  - cxx-compiler
+  - cmake
+  - scikit-build-core
+  - eigen
+  - nanobind
+
+  # Testing
+  - pytest
+
+  # Optional but useful for sparse matrix work
+  - pyamg
+
+  # Ensure pip is available for `pip install .`
+  - pip
+  - pip:
+    - pyvista       # for 3D visualization (not on conda-forge consistently)
