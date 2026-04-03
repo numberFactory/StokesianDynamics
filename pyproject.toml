@@ -17,10 +17,7 @@ dependencies = [
 [tool.scikit-build]
 # Tell scikit-build-core where the CMakeLists.txt lives
 cmake.build-type = "Release"
-wheel.packages = []     # no pure-Python packages, extension only
+wheel.packages = []
 
 [tool.scikit-build.cmake.define]
 DOUBLEPRECISION = "0"
-
-# Pass the install prefix so CMakeLists can resolve Python_SITEARCH correctly
-CMAKE_INSTALL_PREFIX = ""

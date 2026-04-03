@@ -6,6 +6,7 @@
 #include <string>
 #include <iomanip>
 #include <Eigen/Dense>  
+#include <filesystem>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -62,12 +63,13 @@ class Lubrication
 Lubrication::Lubrication(double d_cut)
 {
   debye_cut = d_cut;
-  std::string base_dir = __FILENAME__;
-  SetMemberData(base_dir+"/Resistance_Coefs/mob_scalars_WS.txt",         mob_scalars_WS_11, mob_scalars_WS_12, WS_x);
-  SetMemberData(base_dir+"/Resistance_Coefs/res_scalars_JO.txt",         mob_scalars_JO_11, mob_scalars_JO_12, JO_x);
-  SetMemberDataWall(base_dir+"/Resistance_Coefs/mob_scalars_wall_MB_2562_eig_thresh.txt", mob_scalars_wall_2562, Wall_2562_x, true);
-  SetMemberData(base_dir+"/Resistance_Coefs/res_scalars_MB_1.txt",       mob_scalars_MB_11, mob_scalars_MB_12, MB_x);
-  SetMemberDataWall(base_dir+"/Resistance_Coefs/res_scalars_wall_MB.txt",mob_scalars_wall_MB, Wall_MB_x, false);
+  std::string base_dir = (std::filesystem::path(__FILE__).parent_path().parent_path()).string();
+  base_dir += "/resistance_coeffs/";
+  SetMemberData(base_dir+"mob_scalars_WS.txt",         mob_scalars_WS_11, mob_scalars_WS_12, WS_x);
+  SetMemberData(base_dir+"res_scalars_JO.txt",         mob_scalars_JO_11, mob_scalars_JO_12, JO_x);
+  SetMemberDataWall(base_dir+"mob_scalars_wall_MB_2562_eig_thresh.txt", mob_scalars_wall_2562, Wall_2562_x, true);
+  SetMemberData(base_dir+"res_scalars_MB_1.txt",       mob_scalars_MB_11, mob_scalars_MB_12, MB_x);
+  SetMemberDataWall(base_dir+"res_scalars_wall_MB.txt",mob_scalars_wall_MB, Wall_MB_x, false);
 }
 
 
@@ -569,7 +571,7 @@ void Lubrication::ResistCOO_wall(nb::list r_vectors,
 // =============================================================================
 using namespace nanobind::literals;
 
-NB_MODULE(Lubrication_Class, m) {
+NB_MODULE(lubrication, m) {
   m.doc() = "Lubrication class — nanobind wrapper";
 
   nb::class_<Lubrication>(m, "Lubrication")

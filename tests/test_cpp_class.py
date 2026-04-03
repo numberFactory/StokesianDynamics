@@ -10,7 +10,7 @@ import numpy as np
 import sys
 sys.path.insert(0, '.')   # ensure the built module is found if not installed
 
-from Lubrication_Class import Lubrication
+from StokesianDynamics import Lubrication
 
 # =============================================================================
 # Physical parameters
