@@ -8,18 +8,19 @@ resistance COO matrix entries, then prints a summary.
 
 import numpy as np
 import sys
-sys.path.insert(0, '.')   # ensure the built module is found if not installed
+
+sys.path.insert(0, ".")  # ensure the built module is found if not installed
 
 from StokesianDynamics import Lubrication
 
 # =============================================================================
 # Physical parameters
 # =============================================================================
-a        = 1.0          # particle radius
-eta      = 1.0          # fluid viscosity
-d_cut    = 1e-4         # Debye cutoff (minimum gap before clamping)
-cutoff   = 4.0          # pair lubrication cutoff in units of a (centre-centre)
-wall_cutoff = 4.0       # wall lubrication cutoff in units of a (centre-wall)
+a = 1.0  # particle radius
+eta = 1.0  # fluid viscosity
+d_cut = 1e-4  # Debye cutoff (minimum gap before clamping)
+cutoff = 4.0  # pair lubrication cutoff in units of a (centre-centre)
+wall_cutoff = 4.0  # wall lubrication cutoff in units of a (centre-wall)
 
 # Periodic box: no periodicity (set to 0)
 periodic_length = np.array([0.0, 0.0, 0.0])
@@ -30,18 +31,18 @@ periodic_length = np.array([0.0, 0.0, 0.0])
 # Particle 2: nearby, slightly further from wall
 # Both within lubrication range of each other and the wall
 # =============================================================================
-z1 = 1.05 * a     # just above wall (centre-wall gap = 0.05a)
-z2 = 1.10 * a     # slightly higher
+z1 = 1.05 * a  # just above wall (centre-wall gap = 0.05a)
+z2 = 1.10 * a  # slightly higher
 
-r1 = np.array([0.0,    0.0, z1])
-r2 = np.array([2.05*a, 0.0, z2])   # centre-centre distance ~ 2.05a (near contact)
+r1 = np.array([0.0, 0.0, z1])
+r2 = np.array([2.05 * a, 0.0, z2])  # centre-centre distance ~ 2.05a (near contact)
 
 r_vectors = [r1, r2]
 
 # Neighbour list: particle 0 sees particle 1 and vice versa
 n_list = [
-    np.array([1], dtype=np.int32),   # neighbours of particle 0
-    np.array([0], dtype=np.int32),   # neighbours of particle 1
+    np.array([1], dtype=np.int32),  # neighbours of particle 0
+    np.array([0], dtype=np.int32),  # neighbours of particle 1
 ]
 
 # =============================================================================
@@ -57,11 +58,17 @@ print("Done.\n")
 data_sup, rows_sup, cols_sup = [], [], []
 
 lub.ResistCOO(
-    r_vectors, n_list,
-    a, eta, cutoff, wall_cutoff,
+    r_vectors,
+    n_list,
+    a,
+    eta,
+    cutoff,
+    wall_cutoff,
     periodic_length,
-    True,             # Sup_if_true = True -> use Stokesian Dynamics scalars
-    data_sup, rows_sup, cols_sup
+    True,  # Sup_if_true = True -> use Stokesian Dynamics scalars
+    data_sup,
+    rows_sup,
+    cols_sup,
 )
 
 data_sup = np.array(data_sup)
@@ -82,10 +89,14 @@ data_wall, rows_wall, cols_wall = [], [], []
 
 lub.ResistCOO_wall(
     r_vectors,
-    a, eta, wall_cutoff,
+    a,
+    eta,
+    wall_cutoff,
     periodic_length,
-    True,             # Sup scalars
-    data_wall, rows_wall, cols_wall
+    True,  # Sup scalars
+    data_wall,
+    rows_wall,
+    cols_wall,
 )
 
 data_wall = np.array(data_wall)
@@ -100,9 +111,9 @@ print(f"  Min |value|               : {np.min(np.abs(data_wall)):.6e}\n")
 # =============================================================================
 # Test 3: Single pair resistance matrix printout via ResistPairSup_py
 # =============================================================================
-r_vec   = r2 - r1
-r_norm  = np.linalg.norm(r_vec) / a
-r_hat   = r_vec / np.linalg.norm(r_vec)
+r_vec = r2 - r1
+r_norm = np.linalg.norm(r_vec) / a
+r_hat = r_vec / np.linalg.norm(r_vec)
 
 print("=== Single pair resistance matrix (ResistPairSup_py) ===")
 print(f"  Centre-centre distance : {r_norm:.4f} a")
@@ -114,8 +125,8 @@ lub.ResistPairSup_py(r_norm, a, eta, r_hat)
 # =============================================================================
 from scipy.sparse import coo_matrix
 
-n_dof  = 2 * 6   # 2 particles x 6 DOF each
-R_sup  = coo_matrix((data_sup, (rows_sup, cols_sup)), shape=(n_dof, n_dof)).toarray()
+n_dof = 2 * 6  # 2 particles x 6 DOF each
+R_sup = coo_matrix((data_sup, (rows_sup, cols_sup)), shape=(n_dof, n_dof)).toarray()
 
 sym_err = np.max(np.abs(R_sup - R_sup.T))
 print(f"\n=== Symmetry check (Sup full matrix) ===")
