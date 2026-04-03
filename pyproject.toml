@@ -7,17 +7,6 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "Lubrication"
-version = "1.0.0"
+version = "0.1.0"
 description = "Lubrication corrections for rigid body hydrodynamics via nanobind"
 requires-python = ">=3.8"
-dependencies = [
-    "numpy>=1.21",
-]
-
-[tool.scikit-build]
-# Tell scikit-build-core where the CMakeLists.txt lives
-cmake.build-type = "Release"
-wheel.packages = []
-
-[tool.scikit-build.cmake.define]
-DOUBLEPRECISION = "0"

@@ -3,17 +3,6 @@ project(lubrication LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_BUILD_TYPE Release)
-
-set(CMAKE_MODULE_PATH
-    ${CMAKE_MODULE_PATH}
-    "${CMAKE_SOURCE_DIR}/cmake/"
-    "$ENV{CONDA_PREFIX}/share/cmake/Modules"
-)
-
-if(DOUBLEPRECISION)
-  add_compile_definitions(PUBLIC DOUBLE_PRECISION)
-endif()
 
 find_package(Python REQUIRED COMPONENTS Interpreter Development)
 find_package(Eigen3 REQUIRED NO_MODULE)
