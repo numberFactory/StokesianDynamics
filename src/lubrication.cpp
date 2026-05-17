@@ -600,44 +600,6 @@ void Lubrication::ResistCOO(nb::list r_vectors, nb::list n_list, double a,
   }
 }
 
-void Lubrication::ResistCOO_wall(nb::list r_vectors, double a, double eta,
-                                 double wall_cutoff, nb_array_d periodic_length,
-                                 bool Sup_if_true, nb::list data, nb::list rows,
-                                 nb::list cols) {
-  int num_bodies = (int)r_vectors.size();
-  double mob_factor[3] = {6.0 * M_PI * eta * a, 6.0 * M_PI * eta * a * a,
-                          6.0 * M_PI * eta * a * a * a};
-  Matrix R_wall;
-  double R_val;
-  const double m_eps = 1e-12;
-
-  for (int j = 0; j < num_bodies; j++) {
-    nb_array_d r_j = nb::cast<nb_array_d>(r_vectors[j]);
-    double height = r_j(2) / a;
-
-    if (height < wall_cutoff) {
-      continue;
-    }
-
-    if (Sup_if_true)
-      R_wall = WallResistMatrix(height, mob_factor, Wall_2562_x,
-                                mob_scalars_wall_2562);
-    else
-      R_wall = WallResistMatrixMB(height, mob_factor, Wall_MB_x,
-                                  mob_scalars_wall_MB);
-
-    for (int row = 0; row < 6; row++)
-      for (int col = 0; col < 6; col++) {
-        R_val = R_wall(row, col);
-        if (fabs(R_val) > m_eps) {
-          data.append(R_val);
-          rows.append(row + j * 6);
-          cols.append(col + j * 6);
-        }
-      }
-  }
-}
-
 // =============================================================================
 // nanobind module definition
 // =============================================================================
@@ -652,9 +614,6 @@ NB_MODULE(lubrication, m) {
       .def("ResistCOO", &Lubrication::ResistCOO, "r_vectors"_a, "n_list"_a,
            "a"_a, "eta"_a, "cutoff"_a, "wall_cutoff"_a, "periodic_length"_a,
            "Sup_if_true"_a, "data"_a, "rows"_a, "cols"_a)
-      .def("ResistCOO_wall", &Lubrication::ResistCOO_wall, "r_vectors"_a, "a"_a,
-           "eta"_a, "wall_cutoff"_a, "periodic_length"_a, "Sup_if_true"_a,
-           "data"_a, "rows"_a, "cols"_a)
       .def("ResistPairSup_py", &Lubrication::ResistPairSup_py, "r_norm"_a,
            "a"_a, "eta"_a, "r_hat"_a);
 }

@@ -18,9 +18,9 @@ from StokesianDynamics import Lubrication
 # =============================================================================
 a = 1.0  # particle radius
 eta = 1.0  # fluid viscosity
-d_cut = 1e-4  # Debye cutoff (minimum gap before clamping)
-cutoff = 4.0  # pair lubrication cutoff in units of a (centre-centre)
-wall_cutoff = 4.0  # wall lubrication cutoff in units of a (centre-wall)
+d_cut = 1e-2  # Debye cutoff (minimum gap before clamping)
+cutoff = 4.5  # pair lubrication cutoff in units of a (centre-centre)
+wall_cutoff = 1.0e10  # wall lubrication cutoff in units of a (centre-wall)
 
 # Periodic box: no periodicity (set to 0)
 periodic_length = np.array([0.0, 0.0, 0.0])
@@ -82,34 +82,10 @@ print(f"  Min |value|               : {np.min(np.abs(data_sup)):.6e}")
 print(f"  Row range                 : [{rows_sup.min()}, {rows_sup.max()}]")
 print(f"  Col range                 : [{cols_sup.min()}, {cols_sup.max()}]\n")
 
-# =============================================================================
-# Test 2: Wall-only resistance matrix
-# =============================================================================
-data_wall, rows_wall, cols_wall = [], [], []
 
-lub.ResistCOO_wall(
-    r_vectors,
-    a,
-    eta,
-    wall_cutoff,
-    periodic_length,
-    True,  # Sup scalars
-    data_wall,
-    rows_wall,
-    cols_wall,
-)
-
-data_wall = np.array(data_wall)
-rows_wall = np.array(rows_wall)
-cols_wall = np.array(cols_wall)
-
-print("=== Wall-only resistance matrix ===")
-print(f"  Number of nonzero entries : {len(data_wall)}")
-print(f"  Max |value|               : {np.max(np.abs(data_wall)):.6e}")
-print(f"  Min |value|               : {np.min(np.abs(data_wall)):.6e}\n")
 
 # =============================================================================
-# Test 3: Single pair resistance matrix printout via ResistPairSup_py
+# Test 2: Single pair resistance matrix printout via ResistPairSup_py
 # =============================================================================
 r_vec = r2 - r1
 r_norm = np.linalg.norm(r_vec) / a
