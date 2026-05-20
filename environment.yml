@@ -7,6 +7,7 @@ dependencies:
   - scipy
   - matplotlib
   - libMobility
+  - scikit-sparse
 
   # JIT compilation for Python numerical kernels
   - numba

@@ -1,4 +1,5 @@
 #include <Eigen/Dense>
+#include <Eigen/Sparse>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -10,21 +11,21 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/eigen/sparse.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/stl/pair.h>
 
 namespace nb = nanobind;
 
-// double typedefs
 typedef Eigen::MatrixXd Matrix;
-
-// rigid types
 typedef Eigen::Vector3d Vector3;
 typedef Eigen::Matrix3d Matrix3;
+typedef Eigen::SparseMatrix<double, Eigen::ColMajor> SpMat;
+typedef Eigen::Triplet<double> Triplet;
 
-// Convenience type aliases for nanobind arrays
 using nb_array_d = nb::ndarray<double, nb::ndim<1>, nb::c_contig>;
-using nb_array_i = nb::ndarray<int, nb::ndim<1>, nb::c_contig>;
+using nb_array_i = nb::ndarray<int,    nb::ndim<1>, nb::c_contig>;
 
 class Lubrication {
 private:
@@ -64,14 +65,13 @@ private:
   Matrix ResistPairMB(double r_norm, double mob_factor[3], Vector3 r_hat);
 
 public:
-  void ResistPairSup_py(double r_norm, double a, double eta, nb_array_d r_hat);
-  void ResistCOO(nb::list r_vectors, nb::list n_list, double a, double eta,
-                 double cutoff, double wall_cutoff, nb_array_d periodic_length,
-                 bool Sup_if_true, nb::list data, nb::list rows, nb::list cols);
-  void ResistCOO_wall(nb::list r_vectors, double a, double eta,
-                      double wall_cutoff, nb_array_d periodic_length,
-                      bool Sup_if_true, nb::list data, nb::list rows,
-                      nb::list cols);
+  SpMat ResistCSC(nb::list r_vectors, nb::list n_list, double a, double eta,
+                  double cutoff, double wall_cutoff, nb_array_d periodic_length,
+                  bool Sup_if_true);
+  std::pair<SpMat, SpMat> ResistCSC_both(nb::list r_vectors, nb::list n_list,
+                                          double a, double eta, double cutoff,
+                                          double wall_cutoff,
+                                          nb_array_d periodic_length);
   double debye_cut;
   Lubrication(double d_cut);
 };
@@ -208,16 +208,10 @@ void Lubrication::ResistMatrix(double r_norm, double mob_factor[3],
       a_12[i] = LinearInterp(r_norm, xL, xR, vec_12[Ind][i + 1],
                              vec_12[Ind + 1][i + 1]);
     }
-    X11A = a_11[0];
-    Y11A = a_11[1];
-    Y11B = a_11[2];
-    X11C = a_11[3];
-    Y11C = a_11[4];
-    X12A = a_12[0];
-    Y12A = a_12[1];
-    Y12B = a_12[2];
-    X12C = a_12[3];
-    Y12C = a_12[4];
+    X11A = a_11[0]; Y11A = a_11[1]; Y11B = a_11[2];
+    X11C = a_11[3]; Y11C = a_11[4];
+    X12A = a_12[0]; Y12A = a_12[1]; Y12B = a_12[2];
+    X12C = a_12[3]; Y12C = a_12[4];
   }
 
   Matrix3 squeezeMat = r_hat * r_hat.transpose();
@@ -308,7 +302,7 @@ Lubrication::WallResistMatrix(double r_norm, double mob_factor[3],
                               const std::vector<std::vector<double>> &vec) {
   double Xa, Ya, Yb, Xc, Yc;
   double epsilon = r_norm - 1.0;
-  double tanh_fact = 1.0;
+  //double tanh_fact = 1.0;
 
   if (epsilon < debye_cut) {
     epsilon = debye_cut;
@@ -317,26 +311,17 @@ Lubrication::WallResistMatrix(double r_norm, double mob_factor[3],
 
   int Ind = FindNearestIndexLower(r_norm, x);
   if (Ind == -1) {
-    Xa = vec[0][1];
-    Ya = vec[0][2];
-    Yb = vec[0][3];
-    Xc = vec[0][4];
-    Yc = vec[0][5];
+    Xa = vec[0][1]; Ya = vec[0][2]; Yb = vec[0][3];
+    Xc = vec[0][4]; Yc = vec[0][5];
   } else if (Ind == (int)x.size() - 1) {
     Xa = 1.0 - (9.0 / 8.0) * (1.0 / r_norm);
     Ya = 1.0 - (9.0 / 16.0) * (1.0 / r_norm);
-    Yb = 0.0;
-    Xc = 0.75;
-    Yc = 0.75;
+    Yb = 0.0; Xc = 0.75; Yc = 0.75;
   } else {
     double a[5], xL = x[Ind], xR = x[Ind + 1];
     for (int i = 0; i < 5; i++)
       a[i] = LinearInterp(r_norm, xL, xR, vec[Ind][i + 1], vec[Ind + 1][i + 1]);
-    Xa = a[0];
-    Ya = a[1];
-    Yb = a[2];
-    Xc = a[3];
-    Yc = a[4];
+    Xa = a[0]; Ya = a[1]; Yb = a[2]; Xc = a[3]; Yc = a[4];
   }
 
   double Xa_asym = 1.0 / epsilon - (1.0 / 5.0) * log(epsilon) + 0.971280;
@@ -352,11 +337,11 @@ Lubrication::WallResistMatrix(double r_norm, double mob_factor[3],
   double RXa = 1.0 / Xa, RYa = Yc / denom, RYb = -Yb / denom;
   double RXc = 1.0 / Xc, RYc = Ya / denom;
 
-  Xa = (r_norm > 1.1) ? RXa : Xa_asym;
+  Xa = (r_norm > 1.1)  ? RXa : Xa_asym;
   Ya = (r_norm > 1.01) ? RYa : Ya_asym;
-  Yb = (r_norm > 1.1) ? RYb : Yb_asym;
+  Yb = (r_norm > 1.1)  ? RYb : Yb_asym;
   Xc = (r_norm > 1.01) ? RXc : Xc_asym;
-  Yc = (r_norm > 1.1) ? RYc : Yc_asym;
+  Yc = (r_norm > 1.1)  ? RYc : Yc_asym;
 
   double XcPlus = fmax((Xc - 4.0 / 3.0), 0.0);
   double YcPlus = fmax((Yc - 4.0 / 3.0), 0.0);
@@ -368,9 +353,8 @@ Lubrication::WallResistMatrix(double r_norm, double mob_factor[3],
       mob_factor[2] * YcPlus, 0, 0, mob_factor[1] * Yb, 0, 0, 0,
       mob_factor[2] * YcPlus, 0, 0, 0, 0, 0, 0, mob_factor[2] * XcPlus;
 
-  if (fabs(tanh_fact - 1.0) > 1e-10) {
-    R *= tanh_fact;
-  }
+  // if (fabs(tanh_fact - 1.0) > 1e-10)
+  //   R *= tanh_fact;
   return R;
 }
 
@@ -380,7 +364,7 @@ Lubrication::WallResistMatrixMB(double r_norm, double mob_factor[3],
                                 const std::vector<std::vector<double>> &vec) {
   double Xa, Ya, Yb, Xc, Yc;
   double epsilon = r_norm - 1.0;
-  double tanh_fact = 1.0;
+  //double tanh_fact = 1.0;
 
   if (epsilon < debye_cut) {
     epsilon = debye_cut;
@@ -389,26 +373,17 @@ Lubrication::WallResistMatrixMB(double r_norm, double mob_factor[3],
 
   int Ind = FindNearestIndexLower(r_norm, x);
   if (Ind == -1) {
-    Xa = vec[0][1];
-    Ya = vec[0][2];
-    Yb = vec[0][3];
-    Xc = vec[0][4];
-    Yc = vec[0][5];
+    Xa = vec[0][1]; Ya = vec[0][2]; Yb = vec[0][3];
+    Xc = vec[0][4]; Yc = vec[0][5];
   } else if (Ind == (int)x.size() - 1) {
     Xa = 1.0 / (1.0 - (9.0 / 8.0) * (1.0 / r_norm));
     Ya = 1.0 / (1.0 - (9.0 / 16.0) * (1.0 / r_norm));
-    Yb = 0.0;
-    Xc = 1.0 / 0.75;
-    Yc = 1.0 / 0.75;
+    Yb = 0.0; Xc = 1.0 / 0.75; Yc = 1.0 / 0.75;
   } else {
     double a[5], xL = x[Ind], xR = x[Ind + 1];
     for (int i = 0; i < 5; i++)
       a[i] = LinearInterp(r_norm, xL, xR, vec[Ind][i + 1], vec[Ind + 1][i + 1]);
-    Xa = a[0];
-    Ya = a[1];
-    Yb = a[2];
-    Xc = a[3];
-    Yc = a[4];
+    Xa = a[0]; Ya = a[1]; Yb = a[2]; Xc = a[3]; Yc = a[4];
   }
 
   Matrix R(6, 6);
@@ -419,9 +394,8 @@ Lubrication::WallResistMatrixMB(double r_norm, double mob_factor[3],
       mob_factor[2] * (Yc - 4.0 / 3.0), 0, 0, 0, 0, 0, 0,
       mob_factor[2] * (Xc - 4.0 / 3.0);
 
-  if (fabs(tanh_fact - 1.0) > 1e-10) {
-    R *= tanh_fact;
-  }
+  // if (fabs(tanh_fact - 1.0) > 1e-10)
+  //   R *= tanh_fact;
   return R;
 }
 
@@ -435,7 +409,7 @@ Matrix Lubrication::ResistPairSup(double r_norm, double mob_factor[3],
   Matrix R(12, 12);
 
   double epsilon = r_norm - 2.0;
-  double tanh_fact = 1.0;
+  //double tanh_fact = 1.0;
   if (epsilon < debye_cut) {
     epsilon = debye_cut;
     r_norm = epsilon + 2.0;
@@ -453,9 +427,8 @@ Matrix Lubrication::ResistPairSup(double r_norm, double mob_factor[3],
                  mob_scalars_JO_12);
   }
 
-  if (fabs(tanh_fact - 1.0) > 1e-10) {
-    R *= tanh_fact;
-  }
+  // if (fabs(tanh_fact - 1.0) > 1e-10)
+  //   R *= tanh_fact;
   return R;
 }
 
@@ -465,7 +438,7 @@ Matrix Lubrication::ResistPairMB(double r_norm, double mob_factor[3],
   Matrix R(12, 12);
 
   double epsilon = r_norm - 2.0;
-  double tanh_fact = 1.0;
+  //double tanh_fact = 1.0;
   if (epsilon < debye_cut) {
     epsilon = debye_cut;
     r_norm = epsilon + 2.0;
@@ -473,44 +446,36 @@ Matrix Lubrication::ResistPairMB(double r_norm, double mob_factor[3],
 
   ResistMatrix(r_norm, mob_factor, r_hat, R, inv, MB_x, mob_scalars_MB_11,
                mob_scalars_MB_12);
-  if (fabs(tanh_fact - 1.0) > 1e-10) {
-    R *= tanh_fact;
-  }
+  // if (fabs(tanh_fact - 1.0) > 1e-10)
+  //   R *= tanh_fact;
   return R;
 }
 
-void Lubrication::ResistPairSup_py(double r_norm, double a, double eta,
-                                   nb_array_d r_hat) {
-  Vector3 r_hat_E;
-  r_hat_E << r_hat(0), r_hat(1), r_hat(2);
-  double mob_factor[3] = {6.0 * M_PI * eta * a, 6.0 * M_PI * eta * a * a,
-                          6.0 * M_PI * eta * a * a * a};
-  Matrix R = ResistPairSup(r_norm, mob_factor, r_hat_E);
-  std::cout << "[" << mob_factor[0] << " " << mob_factor[1] << " "
-            << mob_factor[2] << "]\n";
-  std::cout << "[" << r_hat_E[0] << " " << r_hat_E[1] << " " << r_hat_E[2]
-            << "]\n";
-  std::cout << r_norm << "\n" << R << "\n";
-}
-
-void Lubrication::ResistCOO(nb::list r_vectors, nb::list n_list, double a,
-                            double eta, double cutoff, double wall_cutoff,
-                            nb_array_d periodic_length, bool Sup_if_true,
-                            nb::list data, nb::list rows, nb::list cols) {
+// =============================================================================
+// ResistCSC: build sparse matrix using Eigen triplets and return directly.
+// nanobind's eigen/sparse.h type caster converts SpMat -> scipy CSC matrix.
+// =============================================================================
+SpMat Lubrication::ResistCSC(nb::list r_vectors, nb::list n_list, double a,
+                              double eta, double cutoff, double wall_cutoff,
+                              nb_array_d periodic_length, bool Sup_if_true) {
   int num_bodies = (int)r_vectors.size();
-  double mob_factor[3] = {6.0 * M_PI * eta * a, 6.0 * M_PI * eta * a * a,
+  int n_dof      = 6 * num_bodies;
+  double mob_factor[3] = {6.0 * M_PI * eta * a,
+                          6.0 * M_PI * eta * a * a,
                           6.0 * M_PI * eta * a * a * a};
   Vector3 r_jk, r_hat;
   double r_norm, height;
   Matrix R_pair, R_wall;
-  double R_val;
   const double m_eps = 1e-12;
 
+  std::vector<Triplet> triplets;
+  triplets.reserve(num_bodies * 36 * 4);
+
   for (int j = 0; j < num_bodies; j++) {
-    // Extract r_j as a nanobind double array
     nb_array_d r_j = nb::cast<nb_array_d>(r_vectors[j]);
     height = r_j(2) / a;
 
+    // wall contribution
     if (height < wall_cutoff) {
       if (Sup_if_true)
         R_wall = WallResistMatrix(height, mob_factor, Wall_2562_x,
@@ -521,20 +486,16 @@ void Lubrication::ResistCOO(nb::list r_vectors, nb::list n_list, double a,
 
       for (int row = 0; row < 6; row++)
         for (int col = 0; col < 6; col++) {
-          R_val = R_wall(row, col);
-          if (fabs(R_val) > m_eps) {
-            data.append(R_val);
-            rows.append(row + j * 6);
-            cols.append(col + j * 6);
-          }
+          double v = R_wall(row, col);
+          if (std::fabs(v) > m_eps)
+            triplets.emplace_back(row + j*6, col + j*6, v);
         }
     }
 
+    // pair contributions
     nb_array_i neighbors = nb::cast<nb_array_i>(n_list[j]);
     int num_neighbors = (int)neighbors.size();
-    if (num_neighbors == 0) {
-      continue;
-    }
+    if (num_neighbors == 0) continue;
 
     for (int k_ind = 0; k_ind < num_neighbors; k_ind++) {
       int k = neighbors(k_ind);
@@ -545,13 +506,12 @@ void Lubrication::ResistCOO(nb::list r_vectors, nb::list n_list, double a,
         if (periodic_length(l) > 0) {
           double Ll = periodic_length(l);
           r_jk[l] -= (int)(r_jk[l] / Ll +
-                           0.5 * (int(r_jk[l] > 0) - int(r_jk[l] < 0))) *
-                     Ll;
+                           0.5 * (int(r_jk[l] > 0) - int(r_jk[l] < 0))) * Ll;
           r_jk[l] /= a;
         }
       }
       r_norm = r_jk.norm();
-      r_hat = -r_jk / r_norm; // negative sign preserved
+      r_hat  = -r_jk / r_norm;
 
       if (r_norm < cutoff) {
         if (Sup_if_true)
@@ -559,45 +519,128 @@ void Lubrication::ResistCOO(nb::list r_vectors, nb::list n_list, double a,
         else
           R_pair = ResistPairMB(r_norm, mob_factor, r_hat);
 
-        Matrix R_pair_jj = R_pair.block<6, 6>(0, 0);
-        Matrix R_pair_kk = R_pair.block<6, 6>(6, 6);
-        Matrix R_pair_jk = R_pair.block<6, 6>(0, 6);
-        Matrix R_pair_kj = R_pair.block<6, 6>(6, 0);
+        // four 6x6 blocks: jj, kk, jk, kj
+        const int dof_r[4] = {j*6, k*6, j*6, k*6};
+        const int dof_c[4] = {j*6, k*6, k*6, j*6};
+        const int blk_r[4] = {0,   6,   0,   6  };
+        const int blk_c[4] = {0,   6,   6,   0  };
 
-        for (int row = 0; row < 6; row++)
-          for (int col = 0; col < 6; col++) {
-            // jj block
-            R_val = R_pair_jj(row, col);
-            if (fabs(R_val) > m_eps) {
-              data.append(R_val);
-              rows.append(row + j * 6);
-              cols.append(col + j * 6);
+        for (int b = 0; b < 4; b++)
+          for (int row = 0; row < 6; row++)
+            for (int col = 0; col < 6; col++) {
+              double v = R_pair(blk_r[b] + row, blk_c[b] + col);
+              if (std::fabs(v) > m_eps)
+                triplets.emplace_back(dof_r[b] + row, dof_c[b] + col, v);
             }
-            // kk block
-            R_val = R_pair_kk(row, col);
-            if (fabs(R_val) > m_eps) {
-              data.append(R_val);
-              rows.append(row + k * 6);
-              cols.append(col + k * 6);
-            }
-            // jk block
-            R_val = R_pair_jk(row, col);
-            if (fabs(R_val) > m_eps) {
-              data.append(R_val);
-              rows.append(row + j * 6);
-              cols.append(col + k * 6);
-            }
-            // kj block
-            R_val = R_pair_kj(row, col);
-            if (fabs(R_val) > m_eps) {
-              data.append(R_val);
-              rows.append(row + k * 6);
-              cols.append(col + j * 6);
-            }
-          }
       }
     }
   }
+
+  SpMat R(n_dof, n_dof);
+  R.setFromTriplets(triplets.begin(), triplets.end());
+  return R;
+}
+
+// =============================================================================
+// ResistCSC_both: compute MB and Sup matrices in a single pass over all pairs.
+// Shared geometric setup (r_jk, r_norm, r_hat, wall matrices) is computed once
+// per pair, halving the work compared to calling ResistCSC twice.
+// Returns (R_MB, R_Sup) as a pair of scipy CSC matrices.
+// =============================================================================
+std::pair<SpMat, SpMat>
+Lubrication::ResistCSC_both(nb::list r_vectors, nb::list n_list, double a,
+                             double eta, double cutoff, double wall_cutoff,
+                             nb_array_d periodic_length) {
+  int num_bodies = (int)r_vectors.size();
+  int n_dof      = 6 * num_bodies;
+  double mob_factor[3] = {6.0 * M_PI * eta * a,
+                          6.0 * M_PI * eta * a * a,
+                          6.0 * M_PI * eta * a * a * a};
+  Vector3 r_jk, r_hat;
+  double r_norm, height;
+  Matrix R_sup, R_mb, R_wall_sup, R_wall_mb;
+  const double m_eps = 1e-12;
+
+  std::vector<Triplet> trip_mb, trip_sup;
+  trip_mb.reserve(num_bodies * 36 * 4);
+  trip_sup.reserve(num_bodies * 36 * 4);
+
+  // helper lambda: push all nonzero entries of a 6x6 block into a triplet list
+  auto push_block = [&](std::vector<Triplet> &trips, const Matrix &M,
+                        int row_off, int col_off) {
+    for (int row = 0; row < 6; row++)
+      for (int col = 0; col < 6; col++) {
+        double v = M(row, col);
+        if (std::fabs(v) > m_eps)
+          trips.emplace_back(row_off + row, col_off + col, v);
+      }
+  };
+
+  for (int j = 0; j < num_bodies; j++) {
+    nb_array_d r_j = nb::cast<nb_array_d>(r_vectors[j]);
+    height = r_j(2) / a;
+
+    // wall contributions — compute both Sup and MB wall matrices once per particle
+    if (height < wall_cutoff) {
+      R_wall_sup = WallResistMatrix(height, mob_factor, Wall_2562_x,
+                                    mob_scalars_wall_2562);
+      R_wall_mb  = WallResistMatrixMB(height, mob_factor, Wall_MB_x,
+                                      mob_scalars_wall_MB);
+      push_block(trip_sup, R_wall_sup, j*6, j*6);
+      push_block(trip_mb,  R_wall_mb,  j*6, j*6);
+    }
+
+    // pair contributions
+    nb_array_i neighbors = nb::cast<nb_array_i>(n_list[j]);
+    int num_neighbors = (int)neighbors.size();
+    if (num_neighbors == 0) continue;
+
+    for (int k_ind = 0; k_ind < num_neighbors; k_ind++) {
+      int k = neighbors(k_ind);
+      nb_array_d r_k = nb::cast<nb_array_d>(r_vectors[k]);
+
+      // shared geometric setup — computed once for both MB and Sup
+      for (int l = 0; l < 3; ++l) {
+        r_jk[l] = r_j(l) - r_k(l);
+        if (periodic_length(l) > 0) {
+          double Ll = periodic_length(l);
+          r_jk[l] -= (int)(r_jk[l] / Ll +
+                           0.5 * (int(r_jk[l] > 0) - int(r_jk[l] < 0))) * Ll;
+          r_jk[l] /= a;
+        }
+      }
+      r_norm = r_jk.norm();
+      r_hat  = -r_jk / r_norm;
+
+      if (r_norm < cutoff) {
+        // compute both resistance matrices for this pair
+        R_sup = ResistPairSup(r_norm, mob_factor, r_hat);
+        R_mb  = ResistPairMB(r_norm, mob_factor, r_hat);
+
+        const int dof_r[4] = {j*6, k*6, j*6, k*6};
+        const int dof_c[4] = {j*6, k*6, k*6, j*6};
+        const int blk_r[4] = {0,   6,   0,   6  };
+        const int blk_c[4] = {0,   6,   6,   0  };
+
+        for (int b = 0; b < 4; b++) {
+          for (int row = 0; row < 6; row++)
+            for (int col = 0; col < 6; col++) {
+              double vsup = R_sup(blk_r[b] + row, blk_c[b] + col);
+              double vmb  = R_mb (blk_r[b] + row, blk_c[b] + col);
+              if (std::fabs(vsup) > m_eps)
+                trip_sup.emplace_back(dof_r[b] + row, dof_c[b] + col, vsup);
+              if (std::fabs(vmb) > m_eps)
+                trip_mb.emplace_back (dof_r[b] + row, dof_c[b] + col, vmb);
+            }
+        }
+      }
+    }
+  }
+
+  SpMat R_MB_sp(n_dof, n_dof), R_Sup_sp(n_dof, n_dof);
+  R_MB_sp.setFromTriplets(trip_mb.begin(),  trip_mb.end());
+  R_Sup_sp.setFromTriplets(trip_sup.begin(), trip_sup.end());
+  return {R_MB_sp, R_Sup_sp};
 }
 
 // =============================================================================
@@ -611,9 +654,12 @@ NB_MODULE(lubrication, m) {
   nb::class_<Lubrication>(m, "Lubrication")
       .def(nb::init<double>(), "d_cut"_a,
            "Construct Lubrication with a Debye cutoff distance.")
-      .def("ResistCOO", &Lubrication::ResistCOO, "r_vectors"_a, "n_list"_a,
-           "a"_a, "eta"_a, "cutoff"_a, "wall_cutoff"_a, "periodic_length"_a,
-           "Sup_if_true"_a, "data"_a, "rows"_a, "cols"_a)
-      .def("ResistPairSup_py", &Lubrication::ResistPairSup_py, "r_norm"_a,
-           "a"_a, "eta"_a, "r_hat"_a);
+      .def("ResistCSC", &Lubrication::ResistCSC,
+           "r_vectors"_a, "n_list"_a, "a"_a, "eta"_a,
+           "cutoff"_a, "wall_cutoff"_a, "periodic_length"_a, "Sup_if_true"_a,
+           "Returns a scipy CSC sparse matrix of the lubrication resistance.")
+      .def("ResistCSC_both", &Lubrication::ResistCSC_both,
+           "r_vectors"_a, "n_list"_a, "a"_a, "eta"_a,
+           "cutoff"_a, "wall_cutoff"_a, "periodic_length"_a,
+           "Returns (R_MB, R_Sup) as scipy CSC matrices in a single pair loop.");
 }
