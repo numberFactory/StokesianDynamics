@@ -13,7 +13,6 @@ import scipy.sparse as sp
 from sksparse.cholmod import cholesky
 from StokesianDynamics import Lubrication
 from libMobility import NBody, DPStokes
-
 from numba import jit, njit, prange
 
 
@@ -38,9 +37,10 @@ class pyStokesianDynamics(object):
         self.cutoff_wall     = 1.0e10
         self.debye_length    = debye_length
 
-        self.Delta_R = None
-        self.R_MB    = None
-        self.R_Sup   = None
+        self.Delta_R  = None
+        self.R_MB     = None
+        self.R_Sup    = None
+        self.isolated = []   # particles far from wall and all neighbours
 
         self.LC = Lubrication(debye_length)
 
@@ -55,7 +55,8 @@ class pyStokesianDynamics(object):
                 Lx=L[0], Ly=L[1], zmin=0.0, zmax=z_max,
                 allowChangingBoxSize=allowChangingBoxSize
             )
-        self.solver.initialize(viscosity=eta, hydrodynamicRadius=a, includeAngular=True)
+        self.solver.initialize(viscosity=eta, hydrodynamicRadius=a,
+                               includeAngular=True)
 
     def project_to_periodic_image(self, r, L):
         '''
@@ -79,15 +80,15 @@ class pyStokesianDynamics(object):
                 if L[i] > 0:
                     while r_vec[i] < 0:
                         r_vec[i] += L[i]
-                    while r_vec[i] > L[i]:
+                    while r_vec[i] >= L[i]:
                         r_vec[i] -= L[i]
         return r_vecs
 
-    # TODO: neighborlist is ~30% of this calc, the rest is the ResistCSC_both call
+    # TODO: the neighbour list is 30% of this function. The rest is building the sparse matrices.
     def Set_R_Mats(self, r_vecs_np=None):
         '''
         Build lubrication resistance matrices in sparse CSC format.
-        Sets self.R_MB, self.R_Sup, and self.Delta_R = R_Sup - R_MB.
+        Sets self.R_MB, self.R_Sup, self.Delta_R, and self.isolated.
         '''
         if r_vecs_np is None:
             r_vecs_np = [b.location for b in self.bodies]
@@ -102,10 +103,17 @@ class pyStokesianDynamics(object):
 
         r_tree = spatial.cKDTree(np.array(r_vecs), boxsize=self.periodic_length,
                                  balanced_tree=False, compact_nodes=False)
-        neighbors = []
+
+        # build neighbour list (upper triangle) and isolated particle list
+        neighbors     = []
+        self.isolated = []
         for j in range(num_particles):
-            idx = r_tree.query_ball_point(r_vecs[j], r=self.cutoff * self.a)
-            neighbors.append(np.array([i for i in idx if i > j], dtype=np.int32))
+            idx   = r_tree.query_ball_point(r_vecs[j], r=self.cutoff * self.a)
+            upper = [i for i in idx if i > j]
+            neighbors.append(np.array(upper, dtype=np.int32))
+            # isolated: above wall cutoff height and no pair neighbours
+            if r_vecs[j][2] >= self.cutoff * self.a and not upper:
+                self.isolated.append(j)
 
         self.R_MB, self.R_Sup = self.LC.ResistCSC_both(
             r_vecs, neighbors, self.a, self.eta,
@@ -136,3 +144,209 @@ class pyStokesianDynamics(object):
         UW = np.concatenate((U.reshape(num_particles, 3),
                              W.reshape(num_particles, 3)), axis=1)
         return UW.flatten()
+
+    def IpMDR_Mult(self, X):
+        '''
+        Returns (I + M_RPY * Delta_R) * X
+        '''
+        D_R       = self.Delta_R.dot(X)
+        M_Delta_R = self.Wall_Mobility_Mult(D_R)
+        return X + M_Delta_R
+
+    def IpMDR_PC(self, X, R_fact=None):
+        '''
+        Returns (R_fact)^{-1} * X except for particles in self.isolated,
+        which return X unchanged.
+        '''
+        RHS = self.R_MB.dot(X)
+        for k in self.isolated:
+            RHS[6*k:6*k+6] = 0.0
+        Y_F = R_fact(RHS)
+        for k in self.isolated:
+            Y_F[6*k:6*k+6] = X[6*k:6*k+6]
+        return Y_F
+
+    def Lubrication_solve(self, X, Xm, X0=None, print_residual=False, its_out=1000):
+        '''
+        Solve the lubrication problem using GMRES.
+        Computes U = [I + M_RPY * Delta_R]^{-1} * (X + M * Xm).
+        Requires Set_R_Mats() to have been called first.
+        '''
+        if self.Delta_R is None:
+            self.Set_R_Mats()
+
+        num_particles = len(self.bodies)
+
+        RHS = np.zeros(6 * num_particles)
+        if Xm is not None:
+            RHS += self.Wall_Mobility_Mult(Xm)
+        if X is not None:
+            RHS += X.ravel()
+
+        RHS_norm = np.linalg.norm(RHS)
+        if RHS_norm > 0:
+            RHS = RHS / RHS_norm
+
+        small           = 6.0 * np.pi * self.eta * self.a * self.tolerance
+        Eig_Shift_R_Sup = self.R_Sup + sp.diags(
+            small * np.ones(6 * num_particles), 0, format='csc')
+        factor = cholesky(Eig_Shift_R_Sup)
+
+        PC = spla.LinearOperator(
+            (6 * num_particles, 6 * num_particles),
+            matvec=partial(self.IpMDR_PC, R_fact=factor), dtype='float64')
+
+        A = spla.LinearOperator(
+            (6 * num_particles, 6 * num_particles),
+            matvec=self.IpMDR_Mult, dtype='float64')
+
+        if X0 is not None:
+            X0 = X0 / RHS_norm
+
+        res_list = []
+        U_gmres, info = pyamg.krylov.fgmres(
+            A, RHS, x0=X0, tol=self.tolerance, M=PC,
+            maxiter=min(its_out, A.shape[0]),
+            restart=min(100, A.shape[0]),
+            residuals=res_list)
+
+        if RHS_norm > 0:
+            U_gmres = U_gmres * RHS_norm
+
+        if print_residual:
+            print(f'GMRES: {len(res_list)} iterations, '
+                  f'info={info}, final residual={res_list[-1]:.3e}')
+
+        return U_gmres
+    
+
+    def Lub_Mobility_Root_RHS(self):
+        '''
+        Returns RHS_Xm = sqrt(2kT/dt) * Delta_R^{1/2} * W1
+            and RHS_X  = sqrt(2kT/dt) * M^{1/2} * W
+        for use in Lubrication_solve to compute the square root of the
+        lubrication-corrected mobility.
+        '''
+        num_particles       = len(self.bodies)
+        Dim                 = 6*num_particles
+        W1                  = np.random.randn(Dim)
+        prefactor           = np.sqrt(2.0 * self.kT / self.dt)
+
+        # Delta_R^{1/2} * W1 via Cholesky of shifted Delta_R
+        small        = 1e-5 * 6.0 * np.pi * self.eta * self.a
+        Eig_Shift_DR = self.Delta_R + sp.diags(
+            small * np.ones(Dim), 0, format='csc')
+        factor  = cholesky(Eig_Shift_DR)
+        DRhalf  = factor.apply_Pt(factor.L().dot(W1))
+
+        # M^{1/2} * W via sqrtMdotW — W is generated internally by libMobility
+        sqrtM_W_U, sqrtM_W_W = self.solver.sqrtMdotW()
+        sqrtM_W = np.concatenate(
+            (sqrtM_W_U.reshape(num_particles, 3),
+             sqrtM_W_W.reshape(num_particles, 3)), axis=1
+        ).flatten()
+
+        return prefactor * DRhalf, prefactor * sqrtM_W
+    
+    def Update_Bodies_Trap(self, FT_calc, stochastic=True):
+        '''
+        Predictor-corrector (trapezoidal) timestep update.
+        stochastic=True  : includes Brownian noise and drift terms.
+        stochastic=False : purely deterministic, force-driven.
+        Returns (reject_wall, reject_jump).
+        '''
+        L = self.periodic_length
+
+        # save initial configuration into _old slots
+        for b in self.bodies:
+            np.copyto(b.location_old, b.location)
+            b.orientation_old = copy.copy(b.orientation)
+
+        # wrapped positions and forces for predictor
+        r_vecs_np = [b.location for b in self.bodies]
+        r_vecs    = self.put_r_vecs_in_periodic_box(r_vecs_np, L)
+        FT        = FT_calc(self.bodies, r_vecs).flatten()
+
+        # stochastic RHS — computed once, reused in both pred. and corr.
+        if stochastic:
+            Root_Xm, Root_X = self.Lub_Mobility_Root_RHS()
+            MXm   = self.Wall_Mobility_Mult(Root_Xm)
+            Mhalf = Root_X + MXm
+
+            div_U, div_W = self.solver.divM()
+            div_UW = np.concatenate(
+                (div_U.reshape(len(self.bodies), 3),
+                 div_W.reshape(len(self.bodies), 3)), axis=1).flatten()
+            D_M = 2.0 * self.kT * div_UW
+        else:
+            Mhalf = None
+            D_M   = None
+
+        # predictor solve
+        vel_p = self.Lubrication_solve(X=Mhalf, Xm=FT)
+
+        # update current slots from _old + predictor velocity
+        for k, b in enumerate(self.bodies):
+            b.location    = b.location_old.copy()
+            b.orientation = copy.copy(b.orientation_old)
+            b.update(vel_p[6*k:6*k+3] * self.dt,
+                     vel_p[6*k+3:6*k+6] * self.dt,
+                     target='current')
+
+        # rebuild resistance matrices at corrector positions
+        r_vecs_np_c = [b.location for b in self.bodies]
+        r_vecs_c    = self.put_r_vecs_in_periodic_box(r_vecs_np_c, L)
+        self.Set_R_Mats(r_vecs_np=r_vecs_c)
+
+        # corrector solve — use predictor velocity as initial guess
+        FT_C    = FT_calc(self.bodies, r_vecs_c).flatten()
+        RHS_X_C = (D_M + Mhalf) if stochastic else None
+        vel_c   = self.Lubrication_solve(X=RHS_X_C, Xm=FT_C, X0=vel_p)
+
+        # trapezoidal average → write into _new slots
+        vel_trap = 0.5 * (vel_c + vel_p)
+        for k, b in enumerate(self.bodies):
+            b.location_new    = b.location_old.copy()
+            b.orientation_new = copy.copy(b.orientation_old)
+            b.update(vel_trap[6*k:6*k+3] * self.dt,
+                     vel_trap[6*k+3:6*k+6] * self.dt,
+                     target='new')
+
+        reject_wall, reject_jump = self.Check_Update_With_Jump_Trap()
+        self.num_rejections_wall += reject_wall
+        self.num_rejections_jump += reject_jump
+
+        # accept or reject
+        if (reject_wall + reject_jump) == 0:
+            for b in self.bodies:
+                b.update(np.zeros(3), np.zeros(3), target='current')
+                np.copyto(b.location, b.location_new)
+                b.orientation = copy.copy(b.orientation_new)
+        else:
+            for b in self.bodies:
+                np.copyto(b.location, b.location_old)
+                b.orientation = copy.copy(b.orientation_old)
+
+        self.Set_R_Mats()
+        return reject_wall, reject_jump
+    
+    
+    def Check_Update_With_Jump_Trap(self):
+        '''
+        Reject a timestep if any particle crosses the wall (z < 0) or
+        moves more than 2a in a single step.
+        Returns (reject_wall, reject_jump).
+        '''
+        for b in self.bodies:
+            if b.location_new[2] < 0:
+                print("Rejected timestep: wall crossing.")
+                return 1, 0
+
+            r    = self.project_to_periodic_image(
+                b.location_new - b.location_old, self.periodic_length)
+            disp = np.linalg.norm(r)
+            if disp > 2 * self.a:
+                print(f"Rejected timestep: large jump ({disp:.4f} > {2*self.a:.4f}).")
+                return 0, 1
+
+        return 0, 0

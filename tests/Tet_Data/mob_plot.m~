@@ -1,0 +1,79 @@
+clc
+%close all
+
+set(0,'defaulttextfontsize',25);
+set(0,'defaultaxesfontsize',25);
+set(0,'defaultaxeslinewidth',3);
+set(0, 'DefaultLineLineWidth',3);
+set(0, 'defaultAxesTickLabelInterpreter','latex'); 
+set(0, 'defaultLegendInterpreter','latex');
+set(0,'defaultTextInterpreter','latex');
+
+Lub = dlmread('tetra_Lub_mob.dat');
+Lub_spec = dlmread('tetra_Spec_Lub_mob.dat'); %Old Pair *and* wall coefs
+Lub_all = dlmread('tetra_Spec_RPYcoef_Lub_mob.dat'); %New Pair *and* wall coefs
+Lub_wall = dlmread('tetra_Spec_RPYWallcoef_Lub_mob.dat'); %Only new wall coefs
+MB12 = dlmread('tetra_mb12_mob.dat');
+MB42 = dlmread('tetra_mb42_mob.dat');
+MB162 = dlmread('tetra_mb162_mob.dat');
+MB642 = dlmread('tetra_mb642_mob.dat');
+MB2562 = dlmread('tetra_mb2562_mob.dat');
+epsilon = MB2562(:,1);
+norms = 0*epsilon;
+norms12 = 0*epsilon;
+norms42 = 0*epsilon;
+norms162 = 0*epsilon;
+norms642 = 0*epsilon;
+for i = 1:length(epsilon)
+    Mob_L = reshape(Lub(i,2:end),4*6,4*6);
+    Mob_L_spec = reshape(Lub_spec(i,2:end),4*6,4*6);
+    Mob_L_all = reshape(Lub_all(i,2:end),4*6,4*6);
+    Mob_L_wall = reshape(Lub_wall(i,2:end),4*6,4*6);
+    Mob_12 = reshape(MB12(i,2:end),4*6,4*6);
+    Mob_42 = reshape(MB42(i,2:end),4*6,4*6);
+    Mob_162 = reshape(MB162(i,2:end),4*6,4*6);
+    Mob_642 = reshape(MB642(i,2:end),4*6,4*6);
+    Mob_2562 = reshape(MB2562(i,2:end),4*6,4*6);
+    
+    
+    norms(i) = norm(Mob_L-Mob_2562)/norm(Mob_2562);
+    norms_spec(i) = norm(Mob_L_spec-Mob_2562)/norm(Mob_2562);
+    norms_all(i) = norm(Mob_L_all-Mob_2562)/norm(Mob_2562);
+    norms_wall(i) = norm(Mob_L_wall-Mob_2562)/norm(Mob_2562);
+    norms12(i) = norm(Mob_2562-Mob_12)/norm(Mob_2562);
+    norms42(i) = norm(Mob_2562-Mob_42)/norm(Mob_2562);
+    norms162(i) = norm(Mob_2562-Mob_162)/norm(Mob_2562);
+    norms642(i) = norm(Mob_2562-Mob_642)/norm(Mob_2562);
+end
+
+base = hex2rgb('#833ab4');
+middle = hex2rgb('#fd1d1d');
+last = hex2rgb('#fcb045');
+
+t = (linspace(0,1,3));
+PC_cols = t'*middle + (1-t')*base;%round(0.8*base);
+PC_cols = [PC_cols; t'*last + (1-t')*middle];
+PC_cols = flipud(PC_cols);
+
+
+
+
+loglog(epsilon-1,norms,'-','color',PC_cols(1,:))
+hold all
+loglog(epsilon-1,norms_all,':','color',PC_cols(2,:))
+hold all
+loglog(epsilon-1,norms_wall,'-.','color',PC_cols(5,:))
+hold all
+loglog(epsilon-1,norms_spec,'--','color',PC_cols(6,:))
+hold all
+loglog(epsilon-1,norms642,'k','linewidth',4)
+leg = legend('RPY Mob: RPY pair, RPY wall','Spec. Mob: RPY pair, RPY wall',...
+             'Lubrication: RPY pair, spec. wall','642 blobs');
+set(leg,'fontsize',45)
+xlim([0.01 2.5])
+% xt = get(gca,'xtick');
+% xt = set(gca,'xtick',sort([xt, 0.01]));
+xlabel('$$\epsilon$$')
+ylabel('Relative Error in Mobility')
+
+print('-depsc','-r300',['/home/bs162/GIT_Directories/GIT_papers/Papers/Lubrication/figures/Tetra_Mobility_Error.eps'])

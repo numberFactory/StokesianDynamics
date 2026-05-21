@@ -22,6 +22,7 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.spatial.transform import Rotation
 from pyStokesianDynamics import pyStokesianDynamics
+from Body import Body
 
 # =============================================================================
 # Parameters
@@ -48,12 +49,6 @@ def make_positions(periodic):
     return [np.array([xy[i, 0], xy[i, 1], z[i]]) for i in range(N)]
 
 
-class Body:
-    def __init__(self, location, rotation=None):
-        self.location = location
-        self.rotation = rotation if rotation is not None else Rotation.identity()
-
-
 # =============================================================================
 # Test helper
 # =============================================================================
@@ -74,9 +69,9 @@ def run_test(label, periodic):
 
     for trial in range(n_trials):
         positions = make_positions(periodic)
-        bodies    = [Body(location=p,
-                          rotation=Rotation.random(random_state=rng))
-                     for p in positions]
+        bodies = [Body(location=p,
+                       orientation=Rotation.random(random_state=rng))
+                  for p in positions]
 
         # --- construction ----------------------------------------------------
         try:
