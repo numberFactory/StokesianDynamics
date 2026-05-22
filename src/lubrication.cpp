@@ -26,17 +26,38 @@ typedef Eigen::Triplet<double> Triplet;
 using nb_array_d = nb::ndarray<double, nb::ndim<1>, nb::c_contig>;
 using nb_array_i = nb::ndarray<int,    nb::ndim<1>, nb::c_contig>;
 
+// =============================================================================
+// Rational fit coefficient layout (shared by Sup and MB):
+//   cf[0]        = crossover epsilon (Sup) or d_cut (MB, no fallback)
+//   cf[1..6]     = p0..p5  (numerator polynomial)
+//   cf[7..11]    = c0..c4  (denominator sqrt coefficients, Q = 1 + sum c_i^2 * eps^(i+1))
+//
+// Fit forms:
+//   non-singular: scalar = P(eps) / Q(eps)
+//   singular:     scalar = S_sing + P(eps) / (Q(eps) * eps)
+//     X11A: S_sing = +0.25/eps,  X12A: S_sing = -0.25/eps
+//
+// Sign convention (consistent with Python extraction via R[1,5] and R[1,11]):
+//   Y11B: fit stores +Y11B  -> use as-is in AssembleResistMatrix
+//   Y12B: fit stores -Y12B  -> negate before passing to AssembleResistMatrix
+// =============================================================================
+
+// Shared helper: evaluate P/Q given pre-computed power arrays ep[6] and eq[5]
+// cf layout: {crossover_or_dcut, p0..p5, c0..c4}
+static inline double eval_PQ(const double* cf,
+                              const double ep[6], const double eq[5]) {
+  double P = cf[1]*ep[0] + cf[2]*ep[1] + cf[3]*ep[2]
+           + cf[4]*ep[3] + cf[5]*ep[4] + cf[6]*ep[5];
+  double Q = 1.0 + cf[7]*cf[7]*eq[0] + cf[8]*cf[8]*eq[1]
+           + cf[9]*cf[9]*eq[2] + cf[10]*cf[10]*eq[3] + cf[11]*cf[11]*eq[4];
+  return P / Q;
+}
+
 class Lubrication {
 private:
-  void SetMemberData(std::string fname,
-                     std::vector<std::vector<double>> &vec_11,
-                     std::vector<std::vector<double>> &vec_12,
-                     std::vector<double> &x);
   void SetMemberDataWall(std::string fname,
                          std::vector<std::vector<double>> &vec,
                          std::vector<double> &x, bool reverse);
-  std::vector<std::vector<double>> mob_scalars_MB_11, mob_scalars_MB_12;
-  std::vector<double> MB_x;
   std::vector<std::vector<double>> mob_scalars_wall_2562;
   std::vector<double> Wall_2562_x;
   std::vector<std::vector<double>> mob_scalars_wall_MB;
@@ -44,23 +65,19 @@ private:
   int FindNearestIndexLower(double r_norm, std::vector<double> &x);
   double LinearInterp(double r_norm, double xL, double xR, double yL,
                       double yR);
-  void ResistMatrix(double r_norm, double mob_factor[3], Vector3 r_hat,
-                    Matrix &R, bool inv, std::vector<double> &x,
-                    const std::vector<std::vector<double>> &vec_11,
-                    const std::vector<std::vector<double>> &vec_12);
-  Matrix WallResistMatrix(double r_norm, double mob_factor[3],
-                          std::vector<double> &x,
-                          const std::vector<std::vector<double>> &vec);
+  Matrix WallResistMatrix  (double r_norm, double mob_factor[3],
+                             std::vector<double> &x,
+                             const std::vector<std::vector<double>> &vec);
   Matrix WallResistMatrixMB(double r_norm, double mob_factor[3],
-                            std::vector<double> &x,
-                            const std::vector<std::vector<double>> &vec);
+                             std::vector<double> &x,
+                             const std::vector<std::vector<double>> &vec);
   Matrix ResistPairSup(double r_norm, double mob_factor[3], Vector3 r_hat);
-  Matrix ResistPairMB(double r_norm, double mob_factor[3], Vector3 r_hat);
-  void AssembleResistMatrix(Matrix &R, double mob_factor[3], Vector3 r_hat,
-                            double X11A, double Y11A, double Y11B,
-                            double X11C, double Y11C, double X12A,
-                            double Y12A, double Y12B, double X12C,
-                            double Y12C);
+  Matrix ResistPairMB (double r_norm, double mob_factor[3], Vector3 r_hat);
+  void   AssembleResistMatrix(Matrix &R, double mob_factor[3], Vector3 r_hat,
+                              double X11A, double Y11A, double Y11B,
+                              double X11C, double Y11C, double X12A,
+                              double Y12A, double Y12B, double X12C,
+                              double Y12C);
 
 public:
   SpMat ResistCSC(nb::list r_vectors, nb::list n_list, double a, double eta,
@@ -75,7 +92,7 @@ public:
 };
 
 // =============================================================================
-// Constructor
+// Constructor — only wall data still loaded from files
 // =============================================================================
 Lubrication::Lubrication(double d_cut) {
   debye_cut = d_cut;
@@ -84,40 +101,13 @@ Lubrication::Lubrication(double d_cut) {
   base_dir += "/resistance_coeffs/";
   SetMemberDataWall(base_dir + "mob_scalars_wall_MB_2562_eig_thresh.txt",
                     mob_scalars_wall_2562, Wall_2562_x, true);
-  SetMemberData(base_dir + "res_scalars_MB_1.txt", mob_scalars_MB_11,
-                mob_scalars_MB_12, MB_x);
   SetMemberDataWall(base_dir + "res_scalars_wall_MB.txt", mob_scalars_wall_MB,
                     Wall_MB_x, false);
 }
 
 // =============================================================================
-// Data loading helpers
+// Wall data loader
 // =============================================================================
-void Lubrication::SetMemberData(std::string fname,
-                                std::vector<std::vector<double>> &vec_11,
-                                std::vector<std::vector<double>> &vec_12,
-                                std::vector<double> &x) {
-  std::ifstream ifs(fname);
-  double tempval;
-  std::vector<double> tempv;
-  if (!ifs.fail()) {
-    int p = 0, c = -1;
-    while (!ifs.eof()) {
-      c++;
-      ifs >> tempval;
-      tempv.push_back(tempval);
-      if (c == 5) {
-        p++; c = -1;
-        if (p % 2) vec_11.push_back(tempv);
-        else        vec_12.push_back(tempv);
-        tempv.clear();
-      }
-    }
-    ifs.close();
-  }
-  for (auto row : vec_11) x.push_back(row[0]);
-}
-
 void Lubrication::SetMemberDataWall(std::string fname,
                                     std::vector<std::vector<double>> &vec,
                                     std::vector<double> &x, bool reverse) {
@@ -160,7 +150,7 @@ double Lubrication::LinearInterp(double r_norm, double xL, double xR,
 }
 
 // =============================================================================
-// Shared matrix assembly from scalars
+// Shared matrix assembly from 10 scalars
 // =============================================================================
 void Lubrication::AssembleResistMatrix(Matrix &R, double mob_factor[3],
                                        Vector3 r_hat,
@@ -196,42 +186,7 @@ void Lubrication::AssembleResistMatrix(Matrix &R, double mob_factor[3],
 }
 
 // =============================================================================
-// ResistMatrix: tabulated scalar lookup + linear interp (used for MB)
-// =============================================================================
-void Lubrication::ResistMatrix(double r_norm, double mob_factor[3],
-                               Vector3 r_hat, Matrix &R, bool inv,
-                               std::vector<double> &x,
-                               const std::vector<std::vector<double>> &vec_11,
-                               const std::vector<std::vector<double>> &vec_12) {
-  double X11A, Y11A, Y11B, X11C, Y11C;
-  double X12A, Y12A, Y12B, X12C, Y12C;
-
-  int Ind = FindNearestIndexLower(r_norm, x);
-  if (Ind == -1 || Ind == (int)x.size() - 1) {
-    int edge = (Ind == -1) ? 0 : ((int)x.size() - 1);
-    X11A = vec_11[edge][1]; Y11A = vec_11[edge][2]; Y11B = vec_11[edge][3];
-    X11C = vec_11[edge][4]; Y11C = vec_11[edge][5];
-    X12A = vec_12[edge][1]; Y12A = vec_12[edge][2]; Y12B = vec_12[edge][3];
-    X12C = vec_12[edge][4]; Y12C = vec_12[edge][5];
-  } else {
-    double a_11[5], a_12[5];
-    double xL = x[Ind], xR = x[Ind + 1];
-    for (int i = 0; i < 5; i++) {
-      a_11[i] = LinearInterp(r_norm, xL, xR, vec_11[Ind][i+1], vec_11[Ind+1][i+1]);
-      a_12[i] = LinearInterp(r_norm, xL, xR, vec_12[Ind][i+1], vec_12[Ind+1][i+1]);
-    }
-    X11A=a_11[0]; Y11A=a_11[1]; Y11B=a_11[2]; X11C=a_11[3]; Y11C=a_11[4];
-    X12A=a_12[0]; Y12A=a_12[1]; Y12B=a_12[2]; X12C=a_12[3]; Y12C=a_12[4];
-  }
-
-  AssembleResistMatrix(R, mob_factor, r_hat,
-                       X11A, Y11A, Y11B, X11C, Y11C,
-                       X12A, Y12A, Y12B, X12C, Y12C);
-  if (inv) R = R.inverse();
-}
-
-// =============================================================================
-// Wall resistance matrices (unchanged from original)
+// Wall resistance matrices (tabulated, unchanged)
 // =============================================================================
 Matrix Lubrication::WallResistMatrix(double r_norm, double mob_factor[3],
                                      std::vector<double> &x,
@@ -311,89 +266,73 @@ Matrix Lubrication::WallResistMatrixMB(double r_norm, double mob_factor[3],
 }
 
 // =============================================================================
-// ResistPairSup: rational fit with hard-coded coefficients.
+// ResistPairSup: rational fit (Sup scalars) with AT asymptotic fallback.
 //
-// Each scalar:
-//   singular (X11A, X12A): below crossover -> AT asymptotic
-//                           above crossover -> 0.25/eps  + P(eps)/(Q(eps)*eps)
-//   non-singular:           below crossover -> AT asymptotic
-//                           above crossover -> P(eps)/Q(eps)
-//
-// Coefficient arrays: {crossover, p0..p5, c0..c4}
-// P(eps) = sum(p_i * eps^i, i=0..5)
-// Q(eps) = 1 + sum(c_i^2 * eps^(i+1), i=0..4)   [always > 0]
+// Coefficient layout: {crossover, p0..p5, c0..c4}
+// below crossover -> AT asymptotic; above -> rational fit
+// Sign note: Y12B fit stores -Y12B (extracted from R[1,11]/f1 = -Y12B),
+//   so we negate it before passing to AssembleResistMatrix.
 // =============================================================================
 Matrix Lubrication::ResistPairSup(double r_norm, double mob_factor[3],
                                   Vector3 r_hat) {
   Matrix R(12, 12);
   double epsilon = r_norm - 2.0;
-  if (epsilon < debye_cut) { epsilon = debye_cut; }
+  if (epsilon < debye_cut) epsilon = debye_cut;
 
-  // Hard-coded fit coefficients from pair_sup_scalar_fits_and_cutoffs_higher_order.txt
-  // Layout: {crossover, p0, p1, p2, p3, p4, p5, c0, c1, c2, c3, c4}
   static const double cf_X11A[12] = {
     7.006673e-02,
     -1.981052779593092e+01,  2.340828937668049e+03,  4.965834145654573e+05,
      1.139263177405481e+06, -3.107490582481417e+04,  6.123746273694200e+03,
     -5.465471058359071e+02, -1.069447402186549e+03, -6.581289099212643e-09,
     -9.673175257729874e-10, -6.988711115145478e-03 };
-
   static const double cf_X12A[12] = {
     2.457900e-02,
     -1.593939244959434e-02,  4.445665389795823e+00, -4.078726991721069e+02,
     -1.034351092030956e+04, -8.219652436471222e+03, -1.370173545248133e+05,
      2.488928114444593e-04, -1.258809718612856e+02,  1.407296176369766e-08,
     -4.892039651123681e+02,  3.407984060897670e+02 };
-
   static const double cf_Y11A[12] = {
     5.228588e-03,
      2.171207126379109e+00,  3.853002949507692e+02,  6.624352544471424e+03,
      1.484697318890232e+04,  7.047767136709095e+03,  6.540531100098950e+03,
     -1.511807925068774e+01,  7.012000660040704e+01, -1.193647614569199e+02,
     -8.041378517885596e+01, -8.122175958097344e+01 };
-
   static const double cf_Y12A[12] = {
     5.248093e-03,
     -1.461562640575963e+00, -2.507841615126929e+02, -4.331083375391881e+03,
     -9.737921752082497e+03, -4.058329204467756e+02,  3.606943711811880e+01,
     -1.596895122841455e+01,  8.109752269618301e+01, -1.638005603371911e+02,
      1.254673064262033e+02,  5.431104446475567e+00 };
-
   static const double cf_Y11B[12] = {
     5.313637e-03,
     -1.043087981132569e+00,  5.195160018422946e+03,  1.121528966727754e+06,
      1.355294010638291e+07, -3.532929933499587e+06,  4.458815880568250e+05,
      6.331300459521475e+01, -1.375961122074268e+03, -7.415395959620902e+03,
     -1.414565234165133e+04, -7.015955939280531e+03 };
-
-  static const double cf_Y12B[12] = {
+  static const double cf_Y12B[12] = {   // fit stores -Y12B
     5.138518e-03,
      1.266855888751514e+00,  6.899463247856546e+02,  4.216236929666354e+04,
      2.147931207416082e+05, -2.876020054138726e+04,  1.086426843098747e+03,
      2.707637792335356e+01, -2.674955385301423e+02,  9.078532792700140e+02,
      9.825987715332953e+02, -5.482196655744529e-01 };
-
   static const double cf_X11C[12] = {
     5.113070e-03,
      1.397874023016620e+00,  1.345883636860944e+01,  2.434301005382227e+04,
      1.444198486149228e+05,  1.003697333447050e+05,  2.410941641426479e+05,
      3.067204057507511e+00,  1.320239652333805e+02,  3.292073502673707e+02,
     -2.743878779348838e+02, -4.252396254964442e+02 };
-
   static const double cf_X12C[12] = {
     5.050000e-03,
     -2.022446304463027e-01, -5.956596895307574e+01, -4.801712239322800e+02,
      2.384455230908337e+02, -5.757163499587050e+01,  5.798541137001251e+00,
      1.748413100133951e+01,  5.819390284035368e+01, -5.863429968285631e+01,
     -1.179113239482045e-01, -4.268683173977720e-09 };
-
   static const double cf_Y11C[12] = {
     5.307046e-03,
      2.802854397382923e+00,  4.462442222692911e+02,  7.021330954933401e+03,
      1.885437964587811e+04,  1.508056246869293e+04, -2.094355307813514e+01,
      1.481417448480583e+01,  6.732984477458869e+01, -1.206040482897068e+02,
     -1.057879287786618e+02, -2.765378408631323e-03 };
-
   static const double cf_Y12C[12] = {
     1.509115e-02,
     -9.141796920496276e-01,  1.342735109731877e+03,  3.936577516657912e+05,
@@ -401,63 +340,46 @@ Matrix Lubrication::ResistPairSup(double r_norm, double mob_factor[3],
      3.866992630227200e+01, -1.228093930062573e+03,  5.906456100095043e+03,
      7.791981385860539e+03,  1.873855300354582e+01 };
 
-  // Pre-compute powers of epsilon and log once
-  const double li   = std::log(1.0 / epsilon);
-  const double eps2 = epsilon * epsilon;
-  const double eps3 = eps2 * epsilon;
-  const double eps4 = eps3 * epsilon;
-  const double eps5 = eps4 * epsilon;
+  const double li    = std::log(1.0 / epsilon);
+  const double eps2  = epsilon*epsilon, eps3=eps2*epsilon,
+               eps4  = eps3*epsilon,    eps5=eps4*epsilon;
   const double ep[6] = {1.0, epsilon, eps2, eps3, eps4, eps5};
   const double eq[5] = {ep[1], ep[2], ep[3], ep[4], ep[5]};
 
-  // Evaluate P/Q rational function from coefficient array
-  auto eval_PQ = [&](const double* cf) -> double {
-    double P = cf[1]*ep[0] + cf[2]*ep[1] + cf[3]*ep[2]
-             + cf[4]*ep[3] + cf[5]*ep[4] + cf[6]*ep[5];
-    double Q = 1.0 + cf[7]*cf[7]*eq[0] + cf[8]*cf[8]*eq[1]
-             + cf[9]*cf[9]*eq[2] + cf[10]*cf[10]*eq[3] + cf[11]*cf[11]*eq[4];
-    return P / Q;
-  };
+  // AT asymptotic fallback lambdas
+  auto AT_X11A=[&]{return  0.995419+0.25/epsilon+0.225*li+0.0267857*epsilon*li;};
+  auto AT_X12A=[&]{return -0.350153-0.25/epsilon-0.225*li-0.0267857*epsilon*li;};
+  auto AT_Y11A=[&]{return  0.998317+0.166667*li;};
+  auto AT_Y12A=[&]{return -0.273652-0.166667*li;};
+  auto AT_Y11B=[&]{return -0.666667*(0.23892-0.25*li-0.125*epsilon*li);};
+  auto AT_Y12B=[&]{return  0.666667*(-0.00162268+0.25*li+0.125*epsilon*li);};
+  auto AT_X11C=[&]{return  1.33333*(1.0518-0.125*epsilon*li);};
+  auto AT_X12C=[&]{return  1.33333*(-0.150257+0.125*epsilon*li);};
+  auto AT_Y11C=[&]{return  1.33333*(0.702834+0.2*li+0.188*epsilon*li);};
+  auto AT_Y12C=[&]{return  1.33333*(-0.027464+0.05*li+0.062*epsilon*li);};
 
-  // Full AT asymptotic formulas
-  auto AT_X11A = [&]{ return  0.995419 + 0.25/epsilon + 0.225*li + 0.0267857*epsilon*li; };
-  auto AT_X12A = [&]{ return -0.350153 - 0.25/epsilon - 0.225*li - 0.0267857*epsilon*li; };
-  auto AT_Y11A = [&]{ return  0.998317 + 0.166667*li; };
-  auto AT_Y12A = [&]{ return -0.273652 - 0.166667*li; };
-  auto AT_Y11B = [&]{ return -0.666667*(0.23892 - 0.25*li - 0.125*epsilon*li); };
-  auto AT_Y12B = [&]{ return  0.666667*(-0.00162268 + 0.25*li + 0.125*epsilon*li); };
-  auto AT_X11C = [&]{ return  1.33333*(1.0518 - 0.125*epsilon*li); };
-  auto AT_X12C = [&]{ return  1.33333*(-0.150257 + 0.125*epsilon*li); };
-  auto AT_Y11C = [&]{ return  1.33333*(0.702834 + 0.2*li + 0.188*epsilon*li); };
-  auto AT_Y12C = [&]{ return  1.33333*(-0.027464 + 0.05*li + 0.062*epsilon*li); };
-
-  // Blended evaluation:
-  //   below crossover  -> AT asymptotic
-  //   above crossover (singular)     -> S_sing + P(eps)/(Q(eps)*eps)
-  //   above crossover (non-singular) -> P(eps)/Q(eps)
-  // For singular scalars, S_sing is only the 1/eps part (what was subtracted
-  // before fitting), NOT the full AT asymptotic.
+  // eval helpers — singular subtracts only the 1/eps part, not the full AT
   auto eval_singular = [&](const double* cf, double S_sing,
                             std::function<double()> at_fn) -> double {
     if (epsilon < cf[0]) return at_fn();
-    return S_sing + eval_PQ(cf) / epsilon;
+    return S_sing + eval_PQ(cf, ep, eq) / epsilon;
   };
   auto eval_regular = [&](const double* cf,
                            std::function<double()> at_fn) -> double {
     if (epsilon < cf[0]) return at_fn();
-    return eval_PQ(cf);
+    return eval_PQ(cf, ep, eq);
   };
 
-  const double X11A = eval_singular(cf_X11A,  0.25/epsilon, AT_X11A);
-  const double X12A = eval_singular(cf_X12A, -0.25/epsilon, AT_X12A);
-  const double Y11A = eval_regular (cf_Y11A,               AT_Y11A);
-  const double Y12A = eval_regular (cf_Y12A,               AT_Y12A);
-  const double Y11B = eval_regular (cf_Y11B,               AT_Y11B);
-  const double Y12B = -eval_regular (cf_Y12B,               AT_Y12B);
-  const double X11C = eval_regular (cf_X11C,               AT_X11C);
-  const double X12C = eval_regular (cf_X12C,               AT_X12C);
-  const double Y11C = eval_regular (cf_Y11C,               AT_Y11C);
-  const double Y12C = eval_regular (cf_Y12C,               AT_Y12C);
+  const double X11A =  eval_singular(cf_X11A,  0.25/epsilon, AT_X11A);
+  const double X12A =  eval_singular(cf_X12A, -0.25/epsilon, AT_X12A);
+  const double Y11A =  eval_regular (cf_Y11A,               AT_Y11A);
+  const double Y12A =  eval_regular (cf_Y12A,               AT_Y12A);
+  const double Y11B =  eval_regular (cf_Y11B,               AT_Y11B);
+  const double Y12B = -eval_regular (cf_Y12B,               AT_Y12B); // fit stores -Y12B
+  const double X11C =  eval_regular (cf_X11C,               AT_X11C);
+  const double X12C =  eval_regular (cf_X12C,               AT_X12C);
+  const double Y11C =  eval_regular (cf_Y11C,               AT_Y11C);
+  const double Y12C =  eval_regular (cf_Y12C,               AT_Y12C);
 
   AssembleResistMatrix(R, mob_factor, r_hat,
                        X11A, Y11A, Y11B, X11C, Y11C,
@@ -466,15 +388,107 @@ Matrix Lubrication::ResistPairSup(double r_norm, double mob_factor[3],
 }
 
 // =============================================================================
-// ResistPairMB: tabulated MB scalars (unchanged from original)
+// ResistPairMB: rational fit (MB scalars). No asymptotic fallback.
+//
+// Coefficient layout: {d_cut, p0..p5, c0..c4}
+// cf[0] is d_cut (lower bound of training range) — used as the clamp.
+// Sign note: same Y12B convention as Sup — fit stores -Y12B, so negate.
 // =============================================================================
 Matrix Lubrication::ResistPairMB(double r_norm, double mob_factor[3],
                                  Vector3 r_hat) {
   Matrix R(12, 12);
   double epsilon = r_norm - 2.0;
-  if (epsilon < debye_cut) { epsilon = debye_cut; r_norm = epsilon + 2.0; }
-  ResistMatrix(r_norm, mob_factor, r_hat, R, false,
-               MB_x, mob_scalars_MB_11, mob_scalars_MB_12);
+  if (epsilon < debye_cut) epsilon = debye_cut;
+
+  static const double mb_X11A[12] = {
+    5.000000e-03,
+    -2.499999982474416e-01,  1.165664399869339e+00,  2.154793952021480e+00,
+     1.270149386850713e+00,  2.483649225013684e-01, -4.186019883001905e-05,
+    -1.378928715644350e+00,  1.156488416728070e+00,  4.976911470183872e-01,
+     4.870465773876030e-06, -4.423392960087700e-07 };
+  static const double mb_X12A[12] = {
+    5.000000e-03,
+     2.500000295508952e-01, -8.497183983207306e-01, -1.951820680989982e-02,
+     2.619149841535253e-01, -4.534273305750967e-01, -3.145525674635611e-01,
+     8.388694341455940e-01,  1.603695663575000e-06, -6.246243735852574e-01,
+     9.857882804654846e-01,  5.012686787659838e-01 };
+  static const double mb_Y11A[12] = {
+    5.000000e-03,
+     1.334448916124861e+00,  1.533276418322284e+00,  2.504280783426653e-02,
+     4.777495936484357e-02,  3.630334324421668e-01,  1.237866143758240e-01,
+     1.289180844579062e+00,  1.602843358683278e-05,  1.263923257788066e-02,
+    -5.997350601777206e-01,  3.521911887962246e-01 };
+  static const double mb_Y12A[12] = {
+    5.000000e-03,
+    -6.167708949219610e-01, -2.537080095626051e-01,  1.307822038490171e-01,
+    -1.204261677530989e-01, -1.206649718042400e-01, -8.620245076540467e-05,
+    -1.298347445853823e+00, -7.248656296164483e-06, -2.865726715854026e-04,
+    -6.865090702813017e-01,  4.033767918608367e-01 };
+  static const double mb_Y11B[12] = {
+    5.000000e-03,
+     1.757300002175146e-01, -1.263482053075663e-01,  5.466331979155107e-02,
+     4.145104715957172e-03, -4.855688014271770e-04,  2.869576324453811e-05,
+    -1.286512595383362e+00, -1.165742481270486e-04, -4.740203421187537e-03,
+    -5.567875571587672e-01, -3.249642869760815e-01 };
+  static const double mb_Y12B[12] = {   // fit stores -Y12B
+    5.000000e-03,
+     3.445954579556256e-01,  1.715184390725956e-02, -8.224756090070001e-02,
+     7.735243406016939e-02,  1.035089219385419e-03, -6.484151006279233e-05,
+    -1.279854181851254e+00, -1.070970483681416e-04, -4.365905834933606e-02,
+    -4.632099590221615e-01,  2.926235258785276e-01 };
+  static const double mb_X11C[12] = {
+    5.000000e-03,
+     1.354497402277264e+00,  1.685515273189768e+00,  3.267336413581359e-02,
+    -1.215634951152663e-02,  9.006177715282025e-01,  9.200311837421076e-01,
+     1.136664193298283e+00, -1.011738645854246e-04,  6.378569015548268e-04,
+     8.207819113317577e-01,  8.307667300391079e-01 };
+  static const double mb_X12C[12] = {
+    5.000000e-03,
+    -1.693122019768674e-01,  9.231352641200651e-02, -1.787657927723367e-02,
+    -1.648168837655593e-02,  2.008204276597000e-03, -1.214848156108869e-04,
+    -1.001192015055246e+00, -1.528540714747427e-07,  6.544951602958429e-02,
+     3.532367548183314e-01,  2.868536488193641e-01 };
+  static const double mb_Y11C[12] = {
+    5.000000e-03,
+     1.427805390573128e+00,  2.108235342790945e+00,  5.698686101168220e-02,
+     1.538429638251989e-02,  4.805901339731146e-01,  2.249137271154556e-01,
+     1.286277704062037e+00, -1.490352315543504e-05,  1.373451534868378e-01,
+     5.996424201465841e-01,  4.107768723410937e-01 };
+  static const double mb_Y12C[12] = {
+    5.000000e-03,
+     1.331703764524452e-01, -8.242976148134072e-02,  2.876821851261879e-02,
+     7.924040945752319e-03, -9.931798750875400e-04,  6.253327411129789e-05,
+     1.272211977886686e+00, -5.812561617915775e-04, -1.858813454068888e-01,
+    -4.861222841829775e-01, -3.301018709137714e-01 };
+
+  const double eps2  = epsilon*epsilon, eps3=eps2*epsilon,
+               eps4  = eps3*epsilon,    eps5=eps4*epsilon;
+  const double ep[6] = {1.0, epsilon, eps2, eps3, eps4, eps5};
+  const double eq[5] = {ep[1], ep[2], ep[3], ep[4], ep[5]};
+
+  // MB: no asymptotic fallback — rational fit used over full range.
+  // Singular scalars: S_sing + P/(Q*eps); non-singular: P/Q.
+  auto eval_singular_mb = [&](const double* cf, double S_sing) -> double {
+    return S_sing + eval_PQ(cf, ep, eq) / epsilon;
+  };
+  auto eval_regular_mb = [&](const double* cf) -> double {
+    return eval_PQ(cf, ep, eq);
+  };
+
+  const double X11A =  eval_singular_mb(mb_X11A,  0.25/epsilon);
+  const double X12A =  eval_singular_mb(mb_X12A, -0.25/epsilon);
+  const double Y11A =  eval_regular_mb (mb_Y11A);
+  const double Y12A =  eval_regular_mb (mb_Y12A);
+  const double Y11B =  eval_regular_mb (mb_Y11B);
+  const double Y12B = -eval_regular_mb (mb_Y12B); // fit stores -Y12B
+  const double X11C =  eval_regular_mb (mb_X11C);
+  const double X12C =  eval_regular_mb (mb_X12C);
+  const double Y11C =  eval_regular_mb (mb_Y11C);
+  const double Y12C =  eval_regular_mb (mb_Y12C);
+
+  AssembleResistMatrix(R, mob_factor, r_hat,
+                       X11A, Y11A, Y11B, X11C, Y11C,
+                       X12A, Y12A, Y12B, X12C, Y12C);
   return R;
 }
 
@@ -552,9 +566,9 @@ SpMat Lubrication::ResistCSC(nb::list r_vectors, nb::list n_list, double a,
     }
   }
 
-  SpMat R(n_dof, n_dof);
-  R.setFromTriplets(triplets.begin(), triplets.end());
-  return R;
+  SpMat Rsp(n_dof, n_dof);
+  Rsp.setFromTriplets(triplets.begin(), triplets.end());
+  return Rsp;
 }
 
 // =============================================================================
