@@ -129,7 +129,5 @@ print(f"  Max |Delta_R (ResistCSC_both) - ref| : {err_ref_both:.6e}")
 
 # =============================================================================
 # TODO:
-# -Add tetrahedron test after full solver (do this first)
-# -Add flag to use the right coeficients when DPStokes is used
 # -Replace the coefficients with the working AK coefficients and check against the old code
 # -Profile for large systems to see if neighbour list is slowing things down

@@ -19,7 +19,7 @@ from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from pyStokesianDynamics import pyStokesianDynamics
-from Body import Body
+from body import Body
 
 # =============================================================================
 # Physical parameters (from inputfile_tetra.dat)

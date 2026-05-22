@@ -22,7 +22,7 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.spatial.transform import Rotation
 from pyStokesianDynamics import pyStokesianDynamics
-from Body import Body
+from body import Body
 
 # =============================================================================
 # Parameters
