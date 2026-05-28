@@ -29,50 +29,49 @@ f1  = 6.0 * np.pi * eta * a**2
 f2  = 6.0 * np.pi * eta * a**3
 
 # =============================================================================
-# 1. Hardcoded RPY rational fit coefficients
-#    u = 1/(1 + h/h_scale),  h_scale=2.0
-#    P(u) = sum(p_i * u^(p_min+i), i=0..4)
-#    Q(u) = 1 + sum(q_i * u^(i+1), i=0..3)
+# RPY rational fits (from rpy_wall_scalar_fits_corrected.txt)
+#    u = 1/(1 + h/h_scale),  h_scale=0.5
+#    P(u) = sum(p_i * u^(p_min+i), i=0..n_num-1)
+#    Q(u) = 1 + sum(q_i * u^(i+1), i=0..n_den-1)
 # =============================================================================
-H_SCALE_RPY = 2.0
+H_SCALE_RPY = 0.5
 
 RPY_COEFFS = {
     'Xa_corr': dict(p_min=1, p=[
-        5.624811222421287e-01, -1.902140800834350e+00,  2.115451678636365e+00,
-       -7.635996664143829e-01, -4.837500295844031e-03],
-        q=[-4.944641980681546e+00,  9.159688702109271e+00,
-           -7.511281900597266e+00,  2.291593234815973e+00]),
+        2.249994311366312e+00, -9.302942542409326e+00,  1.018898977062156e+01,
+       -1.461983146752135e-01],
+        q=[-7.384833913349599e+00,  1.974855818648951e+01,
+           -2.040618954066672e+01,  4.353438654549962e+00]),
     'Ya_corr': dict(p_min=1, p=[
-        2.812105339266384e-01, -1.115099808672645e+00,  1.464702518976790e+00,
-       -6.325034511693657e-01, -6.999899056304174e-03],
-        q=[-5.248201918594638e+00,  1.035754559569218e+01,
-           -9.127978546090679e+00,  3.037666763264918e+00]),
+        1.124980798925478e+00, -5.161218663062001e+00,  7.210326948819593e+00,
+       -2.621851150554913e+00],
+        q=[-6.713754414307387e+00,  1.706822775135723e+01,
+           -1.933894500702774e+01,  7.413436778017460e+00]),
     'Yb':      dict(p_min=4, p=[
-       -7.392648118347235e-03,  3.368845461666825e-03,  1.612424189552847e-02,
-       -1.298745899757570e-02,  9.455887027999391e-03],
-        q=[-5.169293792382640e+00,  1.003175394314084e+01,
-           -8.681787623181577e+00,  2.834997295430568e+00]),
+       -2.019389402582813e+00,  7.475392505257506e+00, -3.877269126222068e+00,
+       -1.028617914833345e+00],
+        q=[-8.683501976306239e+00,  2.835163248843032e+01,
+           -4.234435891678831e+01,  2.531363165467517e+01]),
     'XcPlus':  dict(p_min=3, p=[
-        2.098387553712979e-02, -3.553195250282171e-02,  7.166486859377513e-03,
-       -9.653580363206946e-03,  9.591411297605018e-03],
-        q=[-4.632481897836154e+00,  7.956808419346241e+00,
-           -6.033709799853070e+00,  1.716055087204692e+00]),
+        1.333114620704834e+00, -4.215726080748013e+00, -5.775019233806103e-02,
+        1.969213190855149e-01],
+        q=[-6.164932696556416e+00,  1.247407137449759e+01,
+           -1.135905628832895e+01,  6.141510604219781e+00]),
     'YcPlus':  dict(p_min=3, p=[
-        5.238992353228791e-02, -1.079457649669765e-01,  3.418699552920573e-02,
-       -2.084108061392004e-02,  5.170400576390023e-02],
-        q=[-5.003405409201031e+00,  9.348095205572779e+00,
-           -7.751092728329362e+00,  2.416658256123458e+00]),
+        3.339371808444304e+00, -1.406703500455225e+01,  8.727632354389423e+00,
+        9.801957547519073e+00],
+        q=[-7.179264725936619e+00,  1.782208382807917e+01,
+           -1.884878181254139e+01,  8.912717591979181e+00]),
 }
 
 def eval_rat(h, coeffs, h_scale=H_SCALE_RPY):
-    """Evaluate rational fit at heights h."""
     h   = np.asarray(h, dtype=float)
     u   = 1.0 / (1.0 + h / h_scale)
     pm  = coeffs['p_min']
     p   = coeffs['p']
     q   = coeffs['q']
     P   = sum(p[i] * u**(pm + i) for i in range(len(p)))
-    Q   = 1.0 + sum(q[i] * u**(i+1) for i in range(len(q)))
+    Q   = 1.0 + sum(q[i]    * u**(i+1) for i in range(len(q)))
     return P / Q
 
 def rpy_fit(name, h):
@@ -170,16 +169,16 @@ cutoffs = {
     'Xa_corr': dict(asym=2.0549e-1, rpy=7.0),
     'Ya_corr': dict(asym=2.9118e-2, rpy=5.6),
     'Yb':      dict(asym=1.0e-1, rpy=3.4),
-    'XcPlus':  dict(asym=3.0e-3,    rpy=4.0e-1),
+    'XcPlus':  dict(asym=9.7e-3,    rpy=4.0e-1),
     'YcPlus':  dict(asym=4.56e-2,   rpy=5.0),
 }
 
 # Per-scalar rational fit degrees (n_num, n_den) — tune independently
 fit_degrees = {
-    'Xa_corr': (5, 4),
+    'Xa_corr': (3, 4), # (3,4) seems to work but needs testing. 
     'Ya_corr': (4, 4),
     'Yb':      (5, 4),
-    'XcPlus':  (5, 4),
+    'XcPlus':  (4, 3),
     'YcPlus':  (5, 4),
 }
 
@@ -252,7 +251,8 @@ for name in cutoffs:
 #     ref_eps,
 #     np.logspace(np.log10(ref_eps.max()), 2, 60),
 # ]))
-chi_eps = np.geomspace(1e-3, 10.0, 50000)
+#np.geomspace(1e-3, 2e1, 100000) #
+chi_eps = np.unique(np.concatenate([np.geomspace(1e-3, 10.0, 10000),np.linspace(0.01,0.09,10000), np.linspace(0.1,0.5,50000)]))
 chi_h = chi_eps + 1.0
 
 chimera_delta = {k: np.zeros(len(chi_eps)) for k in cutoffs}
@@ -280,10 +280,12 @@ for i, (e, h) in enumerate(zip(chi_eps, chi_h)):
 # 5. Monitor SPD conditions (do NOT enforce)
 # =============================================================================
 print("\nSPD monitor on chimera grid:")
-n_neg = 0
-n_neg_diag = {k: 0 for k in cutoffs}
+n_neg       = 0
+n_neg_sup   = 0
+n_neg_diag  = {k: 0 for k in cutoffs}
 n_schur_viol = 0
-min_eigs = np.zeros(len(chi_eps))
+min_eigs     = np.zeros(len(chi_eps))
+min_eigs_sup = np.zeros(len(chi_eps))
 
 for i, (e, h) in enumerate(zip(chi_eps, chi_h)):
     Xa = chimera_delta['Xa_corr'][i]
@@ -296,6 +298,17 @@ for i, (e, h) in enumerate(zip(chi_eps, chi_h)):
     min_eigs[i] = eigv.min()
     if eigv.min() < 0:
         n_neg += 1
+
+    # R_sup = RPY + Delta_R
+    rpy_v = {k: float(rpy_fit(k, h)) for k in cutoffs}
+    R_sup = build_R_corr(
+        rpy_v['Xa_corr'] + Xa, rpy_v['Ya_corr'] + Ya, rpy_v['Yb'] + Yb,
+        rpy_v['XcPlus']  + Xc, rpy_v['YcPlus']  + Yc)
+    eigv_sup = np.linalg.eigvalsh(R_sup)
+    min_eigs_sup[i] = eigv_sup.min()
+    if eigv_sup.min() < 0:
+        n_neg_sup += 1
+
     for name, val, scale in [('Xa_corr', Xa, f0), ('Ya_corr', Ya, f0),
                                ('Yb', Yb, 0.0),
                                ('XcPlus', Xc, f2), ('YcPlus', Yc, f2)]:
@@ -305,11 +318,17 @@ for i, (e, h) in enumerate(zip(chi_eps, chi_h)):
     if schur < 0:
         n_schur_viol += 1
 
-print(f"  Negative eigenvalue: {n_neg}/{len(chi_eps)} points")
+print(f"  Delta_R negative eigenvalue: {n_neg}/{len(chi_eps)} points")
 if n_neg > 0:
     neg_mask = min_eigs < 0
-    print(f"  Min eigenvalue range: {min_eigs[neg_mask].min():.2e} .. "
+    print(f"  Delta_R min eigenvalue range: {min_eigs[neg_mask].min():.2e} .. "
           f"{min_eigs[neg_mask].max():.2e}")
+print(f"  R_sup  negative eigenvalue: {n_neg_sup}/{len(chi_eps)} points")
+if n_neg_sup > 0:
+    neg_mask_sup = min_eigs_sup < 0
+    print(f"  R_sup  min eigenvalue range: {min_eigs_sup[neg_mask_sup].min():.2e} .. "
+          f"{min_eigs_sup[neg_mask_sup].max():.2e}  "
+          f"eps in [{chi_eps[neg_mask_sup].min():.4e}, {chi_eps[neg_mask_sup].max():.4e}]")
 for k, v in n_neg_diag.items():
     print(f"  Negative diagonal ({k}): {v} points")
 print(f"  Schur violation (Ya*Yc < Yb^2 scaled): {n_schur_viol} points")
@@ -373,7 +392,7 @@ def save_fit_coeffs(out_path):
 
     print(f"\nFit coefficients saved to: {out_path}")
 
-save_fit_coeffs("wall_deltaR_scalar_fits.txt")
+save_fit_coeffs("wall_deltaR_scalar_fits_corrected.txt")
 
 # =============================================================================
 # Figures

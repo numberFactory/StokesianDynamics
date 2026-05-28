@@ -22,7 +22,7 @@ class pyStokesianDynamics(object):
     '''
 
     def __init__(self, bodies, a, eta, periodic_length,
-                 z_max, cutoff=4.5, debye_length=1e-4, allowChangingBoxSize=False):
+                 z_max, debye_length=1e-4, allowChangingBoxSize=False):
         '''
         Constructor. Initialises lubrication and libMobility solver objects.
         '''
@@ -33,8 +33,7 @@ class pyStokesianDynamics(object):
         self.a               = a
         self.kT              = 0.0041419464
         self.dt              = 1.0
-        self.cutoff          = cutoff
-        self.cutoff_wall     = 1.0e10
+        self.cutoff           = 4.5 # DO NOT CHANGE, FITS ARE HARD-CODED TO THIS VALUE
         self.debye_length    = debye_length
 
         self.Delta_R  = None
@@ -57,6 +56,16 @@ class pyStokesianDynamics(object):
             )
         self.solver.initialize(viscosity=eta, hydrodynamicRadius=a,
                                includeAngular=True)
+
+        # Cumulative timing for Update_Bodies_Trap components (seconds)
+        self.timings = {
+            'set_r_mats':  0.0,
+            'stochastic':  0.0,
+            'ft_calc':     0.0,
+            'solve_pred':  0.0,
+            'solve_corr':  0.0,
+        }
+        self._n_steps_timed = 0
 
     def project_to_periodic_image(self, r, L):
         '''
@@ -116,8 +125,7 @@ class pyStokesianDynamics(object):
                 self.isolated.append(j)
 
         self.R_MB, self.R_Sup = self.LC.ResistCSC_both(
-            r_vecs, neighbors, self.a, self.eta,
-            self.cutoff, self.cutoff_wall, self.periodic_length)
+            r_vecs, neighbors, self.a, self.eta, self.periodic_length)
 
         if self.R_MB.nnz == 0:
             self.R_MB  = sp.diags(small * np.ones(6 * num_particles), 0, format='csc')
@@ -190,6 +198,7 @@ class pyStokesianDynamics(object):
         small           = 6.0 * np.pi * self.eta * self.a * self.tolerance
         Eig_Shift_R_Sup = self.R_Sup + sp.diags(
             small * np.ones(6 * num_particles), 0, format='csc')
+        
         factor = cholesky(Eig_Shift_R_Sup)
 
         PC = spla.LinearOperator(
@@ -233,9 +242,11 @@ class pyStokesianDynamics(object):
         prefactor           = np.sqrt(2.0 * self.kT / self.dt)
 
         # Delta_R^{1/2} * W1 via Cholesky of shifted Delta_R
-        small        = 1e-5 * 6.0 * np.pi * self.eta * self.a
+        small        = 1.0e-5 * 6.0 * np.pi * self.eta * self.a
         Eig_Shift_DR = self.Delta_R + sp.diags(
             small * np.ones(Dim), 0, format='csc')
+
+
         factor  = cholesky(Eig_Shift_DR)
         DRhalf  = factor.apply_Pt(factor.L().dot(W1))
 
@@ -248,7 +259,7 @@ class pyStokesianDynamics(object):
 
         return prefactor * DRhalf, prefactor * sqrtM_W
     
-    def Update_Bodies_Trap(self, FT_calc, stochastic=True):
+    def Update_Bodies_Trap(self, FT_calc, stochastic=True, print_residual=False):
         '''
         Predictor-corrector (trapezoidal) timestep update.
         stochastic=True  : includes Brownian noise and drift terms.
@@ -262,13 +273,18 @@ class pyStokesianDynamics(object):
             np.copyto(b.location_old, b.location)
             b.orientation_old = copy.copy(b.orientation)
 
-        # wrapped positions and forces for predictor
+        # wrapped positions for predictor
         r_vecs_np = [b.location for b in self.bodies]
         r_vecs    = self.put_r_vecs_in_periodic_box(r_vecs_np, L)
-        FT        = FT_calc(self.bodies, r_vecs).flatten()
 
-        # stochastic RHS — computed once, reused in both pred. and corr.
+        # ── FT_calc (predictor) ───────────────────────────────────────────
+        _t0 = time.perf_counter()
+        FT  = FT_calc(self.bodies, r_vecs).flatten()
+        self.timings['ft_calc'] += time.perf_counter() - _t0
+
+        # ── stochastic RHS ────────────────────────────────────────────────
         if stochastic:
+            _t0 = time.perf_counter()
             Root_Xm, Root_X = self.Lub_Mobility_Root_RHS()
             MXm   = self.Wall_Mobility_Mult(Root_Xm)
             Mhalf = Root_X + MXm
@@ -278,12 +294,15 @@ class pyStokesianDynamics(object):
                 (div_U.reshape(len(self.bodies), 3),
                  div_W.reshape(len(self.bodies), 3)), axis=1).flatten()
             D_M = 2.0 * self.kT * div_UW
+            self.timings['stochastic'] += time.perf_counter() - _t0
         else:
             Mhalf = None
             D_M   = None
 
-        # predictor solve
-        vel_p = self.Lubrication_solve(X=Mhalf, Xm=FT)
+        # ── predictor solve ───────────────────────────────────────────────
+        _t0   = time.perf_counter()
+        vel_p = self.Lubrication_solve(X=Mhalf, Xm=FT, print_residual=print_residual)
+        self.timings['solve_pred'] += time.perf_counter() - _t0
 
         # update current slots from _old + predictor velocity
         for k, b in enumerate(self.bodies):
@@ -293,15 +312,23 @@ class pyStokesianDynamics(object):
                      vel_p[6*k+3:6*k+6] * self.dt,
                      target='current')
 
-        # rebuild resistance matrices at corrector positions
+        # ── Set_R_Mats at corrector positions ─────────────────────────────
         r_vecs_np_c = [b.location for b in self.bodies]
         r_vecs_c    = self.put_r_vecs_in_periodic_box(r_vecs_np_c, L)
+        _t0 = time.perf_counter()
         self.Set_R_Mats(r_vecs_np=r_vecs_c)
+        self.timings['set_r_mats'] += time.perf_counter() - _t0
 
-        # corrector solve — use predictor velocity as initial guess
-        FT_C    = FT_calc(self.bodies, r_vecs_c).flatten()
+        # ── FT_calc (corrector) ───────────────────────────────────────────
+        _t0  = time.perf_counter()
+        FT_C = FT_calc(self.bodies, r_vecs_c).flatten()
+        self.timings['ft_calc'] += time.perf_counter() - _t0
+
+        # ── corrector solve ───────────────────────────────────────────────
         RHS_X_C = (D_M + Mhalf) if stochastic else None
-        vel_c   = self.Lubrication_solve(X=RHS_X_C, Xm=FT_C, X0=vel_p)
+        _t0   = time.perf_counter()
+        vel_c = self.Lubrication_solve(X=RHS_X_C, Xm=FT_C, X0=vel_p, print_residual=print_residual)
+        self.timings['solve_corr'] += time.perf_counter() - _t0
 
         # trapezoidal average → write into _new slots
         vel_trap = 0.5 * (vel_c + vel_p)
@@ -327,8 +354,23 @@ class pyStokesianDynamics(object):
                 np.copyto(b.location, b.location_old)
                 b.orientation = copy.copy(b.orientation_old)
 
+        # ── Set_R_Mats for next step ──────────────────────────────────────
+        _t0 = time.perf_counter()
         self.Set_R_Mats()
+        self.timings['set_r_mats'] += time.perf_counter() - _t0
+
+        self._n_steps_timed += 1
         return reject_wall, reject_jump
+
+    def print_timings(self):
+        '''Print mean per-step timings for Update_Bodies_Trap components.'''
+        n = max(self._n_steps_timed, 1)
+        total = sum(self.timings.values())
+        print(f"\n--- Update_Bodies_Trap timings ({n} steps) ---")
+        for key, val in self.timings.items():
+            print(f"  {key:<14s}  {val/n*1e3:8.2f} ms/step  "
+                  f"({100*val/total:.1f}%)")
+        print(f"  {'total':<14s}  {total/n*1e3:8.2f} ms/step")
     
     
     def Check_Update_With_Jump_Trap(self):

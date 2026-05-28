@@ -22,40 +22,34 @@ f2  = 6.0 * np.pi * eta * a**3
 # =============================================================================
 # RPY rational fits (hardcoded)
 # =============================================================================
-# =============================================================================
-# RPY rational fits (from rpy_wall_scalar_fits_corrected.txt)
-#    u = 1/(1 + h/h_scale),  h_scale=0.5
-#    P(u) = sum(p_i * u^(p_min+i), i=0..n_num-1)
-#    Q(u) = 1 + sum(q_i * u^(i+1), i=0..n_den-1)
-# =============================================================================
-H_SCALE_RPY = 0.5
+H_SCALE_RPY = 2.0
 
 RPY_COEFFS = {
     'Xa_corr': dict(p_min=1, p=[
-        2.249994311366312e+00, -9.302942542409326e+00,  1.018898977062156e+01,
-       -1.461983146752135e-01],
-        q=[-7.384833913349599e+00,  1.974855818648951e+01,
-           -2.040618954066672e+01,  4.353438654549962e+00]),
+        5.624811222421287e-01, -1.902140800834350e+00,  2.115451678636365e+00,
+       -7.635996664143829e-01, -4.837500295844031e-03],
+        q=[-4.944641980681546e+00,  9.159688702109271e+00,
+           -7.511281900597266e+00,  2.291593234815973e+00]),
     'Ya_corr': dict(p_min=1, p=[
-        1.124980798925478e+00, -5.161218663062001e+00,  7.210326948819593e+00,
-       -2.621851150554913e+00],
-        q=[-6.713754414307387e+00,  1.706822775135723e+01,
-           -1.933894500702774e+01,  7.413436778017460e+00]),
+        2.812105339266384e-01, -1.115099808672645e+00,  1.464702518976790e+00,
+       -6.325034511693657e-01, -6.999899056304174e-03],
+        q=[-5.248201918594638e+00,  1.035754559569218e+01,
+           -9.127978546090679e+00,  3.037666763264918e+00]),
     'Yb':      dict(p_min=4, p=[
-       -2.019389402582813e+00,  7.475392505257506e+00, -3.877269126222068e+00,
-       -1.028617914833345e+00],
-        q=[-8.683501976306239e+00,  2.835163248843032e+01,
-           -4.234435891678831e+01,  2.531363165467517e+01]),
+       -7.392648118347235e-03,  3.368845461666825e-03,  1.612424189552847e-02,
+       -1.298745899757570e-02,  9.455887027999391e-03],
+        q=[-5.169293792382640e+00,  1.003175394314084e+01,
+           -8.681787623181577e+00,  2.834997295430568e+00]),
     'XcPlus':  dict(p_min=3, p=[
-        1.333114620704834e+00, -4.215726080748013e+00, -5.775019233806103e-02,
-        1.969213190855149e-01],
-        q=[-6.164932696556416e+00,  1.247407137449759e+01,
-           -1.135905628832895e+01,  6.141510604219781e+00]),
+        2.098387553712979e-02, -3.553195250282171e-02,  7.166486859377513e-03,
+       -9.653580363206946e-03,  9.591411297605018e-03],
+        q=[-4.632481897836154e+00,  7.956808419346241e+00,
+           -6.033709799853070e+00,  1.716055087204692e+00]),
     'YcPlus':  dict(p_min=3, p=[
-        3.339371808444304e+00, -1.406703500455225e+01,  8.727632354389423e+00,
-        9.801957547519073e+00],
-        q=[-7.179264725936619e+00,  1.782208382807917e+01,
-           -1.884878181254139e+01,  8.912717591979181e+00]),
+        5.238992353228791e-02, -1.079457649669765e-01,  3.418699552920573e-02,
+       -2.084108061392004e-02,  5.170400576390023e-02],
+        q=[-5.003405409201031e+00,  9.348095205572779e+00,
+           -7.751092728329362e+00,  2.416658256123458e+00]),
 }
 
 def eval_rat(h, coeffs, h_scale=H_SCALE_RPY):
@@ -128,11 +122,13 @@ delta_coeffs = {
                1.554914960487163e+02],
     ),
     'XcPlus': dict(
-        asym_cut = 9.7e-03,
+        asym_cut = 3.0e-03,
         rpy_cut  = 4.0e-01,
         p_min    = 3,
-        pc = [-6.769668477673338e-02,  4.251981921512744e-01,  -4.761218699317399e-01,  -5.662068770688917e-01],
-        qc = [-7.986015731409064e+00,  2.107903159501786e+01,  -1.836099133069141e+01],
+        pc = [-1.363325750623006e-01,  1.661064454119597e+00, -7.478587775449657e+00,
+               1.474504992172720e+01, -1.073379968056573e+01],
+        qc = [-1.156154685363075e+01,  5.011347178843301e+01, -9.652115572123826e+01,
+               6.970392297095620e+01],
     ),
     'YcPlus': dict(
         asym_cut = 4.56e-02,
@@ -178,13 +174,12 @@ def sup_scalar(name, h):
 # =============================================================================
 # Evaluation grid
 # =============================================================================
-# eps_grid = np.unique(np.concatenate([
-#     np.logspace(-4, -1, 20),
-#     np.geomspace(0.02, 0.03, 2000),
-#     np.logspace(-1,  1, 20),
-#     np.logspace( 1,  3,  20),
-# ]))
-eps_grid = np.geomspace(9.0e-3, 7.5, 200000)
+eps_grid = np.unique(np.concatenate([
+    np.logspace(-4, -1, 20),
+    np.geomspace(0.02, 0.03, 2000),
+    np.logspace(-1,  1, 20),
+    np.logspace( 1,  3,  20),
+]))
 h_grid = eps_grid + 1.0
 
 # =============================================================================
@@ -291,3 +286,97 @@ ax2.grid(True, which='both', alpha=0.3)
 plt.tight_layout()
 
 plt.show()
+
+# =============================================================================
+# Singularity checks: denominator roots and sign changes within valid range
+# =============================================================================
+N_SWEEP       = 100000
+NEG_THRESHOLD = -1e-10
+
+# Valid ranges for each scalar in each fit:
+#   RPY:    fits are used for ALL h > 0 (no upper cutoff in rpy_wall)
+#   Delta_R chimera: fit region is [asym_cut, rpy_cut]
+rpy_valid = {k: (0.0, 20.0) for k in names}   # practical upper limit
+dr_valid  = {k: (delta_coeffs[k]['asym_cut'], delta_coeffs[k]['rpy_cut'])
+             for k in names}
+
+
+def denom_roots(qc, h_scale, h_lo, h_hi):
+    """Roots of Q(u)=0 converted to h, filtered to (h_lo, h_hi)."""
+    coeffs = list(reversed(qc)) + [1.0]
+    roots  = np.roots(coeffs)
+    found  = []
+    for r in roots:
+        if abs(r.imag) < 1e-10 * max(abs(r.real), 1e-30) and r.real > 0:
+            h_r = h_scale * (1.0 / r.real - 1.0)
+            if h_lo < h_r < h_hi:
+                found.append(h_r)
+    return sorted(found)
+
+
+def sign_changes(f_vals, h_vals):
+    """h values where f changes sign."""
+    idx = np.where(np.diff(np.sign(f_vals)))[0]
+    return [0.5 * (h_vals[i] + h_vals[i + 1]) for i in idx]
+
+
+def report(name, label, h_scale, qc, eval_fn, h_lo, h_hi):
+    """Check and print poles, sign changes, and negatives for one fit."""
+    h_vals  = np.geomspace(max(h_lo, 1e-6), h_hi, N_SWEEP)
+    f_vals  = eval_fn(h_vals)
+    problems = []
+
+    for h_p in denom_roots(qc, h_scale, h_lo, h_hi):
+        problems.append(f"    POLE  (Q=0)   h = {h_p:.6e}")
+
+    for h_z in sign_changes(f_vals, h_vals):
+        problems.append(f"    ZERO  (f=0)   h = {h_z:.6e}  "
+                        f"fit just above = {float(eval_fn(h_z*1.001)):.4e}")
+
+    neg = f_vals < NEG_THRESHOLD
+    if neg.any():
+        problems.append(f"    NEGATIVE      min = {f_vals[neg].min():.6e}"
+                        f"  at h = {h_vals[np.argmin(f_vals)]:.6e}")
+
+    status = "*** PROBLEMS ***" if problems else "OK"
+    print(f"  {label:<12s} h in ({h_lo:.3e}, {h_hi:.3e})  {status}")
+    for p in problems:
+        print(p)
+    return bool(problems)
+
+
+print("\n" + "="*65)
+print("Singularity / sign / negativity checks")
+print("="*65)
+
+any_problem = False
+for name in names:
+    print(f"\n{name}")
+
+    # --- RPY fit ---
+    rc  = RPY_COEFFS[name]
+    h_lo_r, h_hi_r = rpy_valid[name]
+    def rpy_eval(h, rc=rc):
+        return eval_rat(h, rc, H_SCALE_RPY)
+    any_problem |= report(name, "RPY fit",
+                          H_SCALE_RPY, rc['q'],
+                          rpy_eval, h_lo_r, h_hi_r)
+
+    # --- Delta_R fit (chimera middle region) ---
+    dc   = delta_coeffs[name]
+    h_lo_d, h_hi_d = dr_valid[name]
+    def dr_eval(h, dc=dc):
+        return eval_delta_fit(name, h)
+    any_problem |= report(name, "Delta_R fit",
+                          h_scale_fit, dc['qc'],
+                          dr_eval, h_lo_d, h_hi_d)
+
+    # --- R_sup chimera = RPY + Delta_R (over Delta_R fit range) ---
+    def sup_eval(h, name=name):
+        return np.array([float(sup_scalar(name, hi)) for hi in h])
+    any_problem |= report(name, "R_sup chimera",
+                          None, [],          # no single denom to factor
+                          sup_eval, h_lo_d, h_hi_d)
+
+print(f"\n{'='*65}")
+print("SUMMARY: problems found." if any_problem else "SUMMARY: no problems found.")

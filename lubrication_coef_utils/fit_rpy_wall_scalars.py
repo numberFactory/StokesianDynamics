@@ -68,8 +68,8 @@ print("Done.")
 #
 # Sanathanan-Koerner iteration: each step is a linear lstsq
 # =============================================================================
-H_SCALE = 2.0
-N_NUM   = 5
+H_SCALE = 0.5
+N_NUM   = 4
 N_DEN   = 4
 N_ITER  = 30
 
@@ -216,7 +216,7 @@ plt.tight_layout()
 # =============================================================================
 # Save coefficients
 # =============================================================================
-out_path = 'rpy_wall_scalar_fits.txt'
+out_path = 'rpy_wall_scalar_fits_corrected.txt'
 with open(out_path, 'w') as f:
     f.write("# RPY wall scalar rational fit coefficients\n")
     f.write(f"# u = 1/(1 + h/h_scale),  h_scale={H_SCALE}\n")

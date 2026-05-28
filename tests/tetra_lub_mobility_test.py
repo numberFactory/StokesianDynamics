@@ -41,7 +41,6 @@ CLONES = np.array([
 # =============================================================================
 # Simulation parameters
 # =============================================================================
-cutoff    = 4.5
 Lbig      = 100.0 * a
 L         = np.array([Lbig, Lbig, 0.0])
 n_heights = 500
@@ -134,7 +133,7 @@ def relative_error(data, ref):
 if __name__ == '__main__':
 
     print(f"Computing lubrication mobility for {n_heights} heights...")
-    print(f"a={a}, eta={eta}, cutoff={cutoff}, L={L}")
+    print(f"a={a}, eta={eta}, L={L}")
 
     bodies_init = make_bodies(height=1.01, dist=0.01)
 
@@ -145,7 +144,6 @@ if __name__ == '__main__':
         eta=eta,
         periodic_length=L,
         z_max=z_max,
-        cutoff=cutoff,
     )
 
     # non-periodic solver (NBody)
@@ -155,7 +153,6 @@ if __name__ == '__main__':
         eta=eta,
         periodic_length=np.array([0.0, 0.0, 0.0]),
         z_max=z_max,
-        cutoff=cutoff,
     )
 
     sd_open.tolerance     = 1e-6

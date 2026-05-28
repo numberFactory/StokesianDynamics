@@ -51,7 +51,7 @@ static inline double eval_PQ(const double* cf,
 
 class Lubrication {
 private:
-  Matrix WallResistMatrix  (double r_norm, double mob_factor[3]);
+  Matrix WallDeltaR        (double r_norm, double mob_factor[3]);
   Matrix WallResistMatrixMB(double r_norm, double mob_factor[3]);
   Matrix ResistPairSup(double r_norm, double mob_factor[3], Vector3 r_hat);
   Matrix ResistPairMB (double r_norm, double mob_factor[3], Vector3 r_hat);
@@ -63,13 +63,13 @@ private:
 
 public:
   SpMat ResistCSC(nb::list r_vectors, nb::list n_list, double a, double eta,
-                  double cutoff, double wall_cutoff, nb_array_d periodic_length,
-                  bool Sup_if_true);
+                  nb_array_d periodic_length, bool Sup_if_true);
   std::pair<SpMat, SpMat> ResistCSC_both(nb::list r_vectors, nb::list n_list,
-                                          double a, double eta, double cutoff,
-                                          double wall_cutoff,
+                                          double a, double eta,
                                           nb_array_d periodic_length);
   double debye_cut;
+  // Physical cutoff for pair rational fits — fits are only valid to 4.5a.
+  static constexpr double PAIR_CUTOFF = 4.5;
   Lubrication(double d_cut);
 };
 
@@ -84,7 +84,7 @@ Lubrication::Lubrication(double d_cut) {
 // =============================================================================
 // Wall rational fit helpers
 //
-// RPY fits:     u = 1/(1 + h/2.0),   P/Q, raw q_i
+// RPY fits:     u = 1/(1 + h/0.5),   P/Q, raw q_i
 // Delta_R fits: u = 1/(1 + h/0.5),   P/Q, raw q_i
 //
 // Chimera per scalar:
@@ -105,35 +105,35 @@ static inline double eval_wall_rat(double h, double h_scale,
   return P / Q;
 }
 
-// RPY rational fits (h_scale = 2.0)
+// RPY rational fits (h_scale = 0.5)
 static double rpy_wall(int scalar, double h) {
-  static const double H = 2.0;
-  static const double Xa_p[]={ 5.624811222421287e-01,-1.902140800834350e+00,
-    2.115451678636365e+00,-7.635996664143829e-01,-4.837500295844031e-03};
-  static const double Xa_q[]={-4.944641980681546e+00, 9.159688702109271e+00,
-   -7.511281900597266e+00, 2.291593234815973e+00};
-  static const double Ya_p[]={ 2.812105339266384e-01,-1.115099808672645e+00,
-    1.464702518976790e+00,-6.325034511693657e-01,-6.999899056304174e-03};
-  static const double Ya_q[]={-5.248201918594638e+00, 1.035754559569218e+01,
-   -9.127978546090679e+00, 3.037666763264918e+00};
-  static const double Yb_p[]={-7.392648118347235e-03, 3.368845461666825e-03,
-    1.612424189552847e-02,-1.298745899757570e-02, 9.455887027999391e-03};
-  static const double Yb_q[]={-5.169293792382640e+00, 1.003175394314084e+01,
-   -8.681787623181577e+00, 2.834997295430568e+00};
-  static const double Xc_p[]={ 2.098387553712979e-02,-3.553195250282171e-02,
-    7.166486859377513e-03,-9.653580363206946e-03, 9.591411297605018e-03};
-  static const double Xc_q[]={-4.632481897836154e+00, 7.956808419346241e+00,
-   -6.033709799853070e+00, 1.716055087204692e+00};
-  static const double Yc_p[]={ 5.238992353228791e-02,-1.079457649669765e-01,
-    3.418699552920573e-02,-2.084108061392004e-02, 5.170400576390023e-02};
-  static const double Yc_q[]={-5.003405409201031e+00, 9.348095205572779e+00,
-   -7.751092728329362e+00, 2.416658256123458e+00};
+  static const double H = 0.5;
+  static const double Xa_p[]={ 2.249994311366312e+00,-9.302942542409326e+00,
+    1.018898977062156e+01,-1.461983146752135e-01};
+  static const double Xa_q[]={-7.384833913349599e+00, 1.974855818648951e+01,
+   -2.040618954066672e+01, 4.353438654549962e+00};
+  static const double Ya_p[]={ 1.124980798925478e+00,-5.161218663062001e+00,
+    7.210326948819593e+00,-2.621851150554913e+00};
+  static const double Ya_q[]={-6.713754414307387e+00, 1.706822775135723e+01,
+   -1.933894500702774e+01, 7.413436778017460e+00};
+  static const double Yb_p[]={-2.019389402582813e+00, 7.475392505257506e+00,
+   -3.877269126222068e+00,-1.028617914833345e+00};
+  static const double Yb_q[]={-8.683501976306239e+00, 2.835163248843032e+01,
+   -4.234435891678831e+01, 2.531363165467517e+01};
+  static const double Xc_p[]={ 1.333114620704834e+00,-4.215726080748013e+00,
+   -5.775019233806103e-02, 1.969213190855149e-01};
+  static const double Xc_q[]={-6.164932696556416e+00, 1.247407137449759e+01,
+   -1.135905628832895e+01, 6.141510604219781e+00};
+  static const double Yc_p[]={ 3.339371808444304e+00,-1.406703500455225e+01,
+    8.727632354389423e+00, 9.801957547519073e+00};
+  static const double Yc_q[]={-7.179264725936619e+00, 1.782208382807917e+01,
+   -1.884878181254139e+01, 8.912717591979181e+00};
   switch(scalar) {
-    case 0: return eval_wall_rat(h,H,1,5,4,Xa_p,Xa_q); // Xa_corr = Xa-1
-    case 1: return eval_wall_rat(h,H,1,5,4,Ya_p,Ya_q); // Ya_corr = Ya-1
-    case 2: return eval_wall_rat(h,H,4,5,4,Yb_p,Yb_q); // Yb
-    case 3: return eval_wall_rat(h,H,3,5,4,Xc_p,Xc_q); // XcPlus = Xc-4/3
-    default:return eval_wall_rat(h,H,3,5,4,Yc_p,Yc_q); // YcPlus = Yc-4/3
+    case 0: return eval_wall_rat(h,H,1,4,4,Xa_p,Xa_q); // Xa_corr = Xa-1
+    case 1: return eval_wall_rat(h,H,1,4,4,Ya_p,Ya_q); // Ya_corr = Ya-1
+    case 2: return eval_wall_rat(h,H,4,4,4,Yb_p,Yb_q); // Yb
+    case 3: return eval_wall_rat(h,H,3,4,4,Xc_p,Xc_q); // XcPlus = Xc-4/3
+    default:return eval_wall_rat(h,H,3,4,4,Yc_p,Yc_q); // YcPlus = Yc-4/3
   }
 }
 
@@ -154,12 +154,12 @@ static double delta_R_wall(int scalar, double eps, double h) {
     return asym - rpy_wall(s, h);
   };
 
-  // Xa_corr: asym_cut=0.2055, rpy_cut=7.0, p_min=1, n_p=5, n_q=4
+  // Xa_corr: asym_cut=0.2055, rpy_cut=7.0, p_min=1, n_p=3, n_q=4
   static const double Xa_ac=2.0549e-01, Xa_rc=7.0;
-  static const double Xa_p[]={-4.373370078409577e-04, 4.424560646016040e-03,
-   -7.638777986146561e-02, 9.810003614859475e+00,-3.385902988985162e+01};
-  static const double Xa_q[]={-1.105160500583412e+01, 4.616461895203592e+01,
-   -8.736869111978241e+01, 6.400332372662409e+01};
+  static const double Xa_p[]={ 3.390440744007662e-03,-1.292707770613473e-01,
+    1.621030547158851e+00};
+  static const double Xa_q[]={-9.934759618046485e+00, 3.852782844267631e+01,
+   -6.919767486523838e+01, 4.812890822657162e+01};
   // Ya_corr: asym_cut=0.02912, rpy_cut=5.6, p_min=1, n_p=4, n_q=4
   static const double Ya_ac=2.9118e-02, Ya_rc=5.6;
   static const double Ya_p[]={-1.802661869524016e-03, 9.468660270547602e-03,
@@ -172,12 +172,12 @@ static double delta_R_wall(int scalar, double eps, double h) {
    -2.037770517911233e+02, 6.604148051813611e+02,-7.644275364225128e+02};
   static const double Yb_q[]={-1.458404137489715e+01, 7.817171888830218e+01,
    -1.820761238925333e+02, 1.554914960487163e+02};
-  // XcPlus: asym_cut=0.003, rpy_cut=0.4, p_min=3, n_p=5, n_q=4
-  static const double Xc_ac=3.0e-03, Xc_rc=4.0e-01;
-  static const double Xc_p[]={-1.363325750623006e-01, 1.661064454119597e+00,
-   -7.478587775449657e+00, 1.474504992172720e+01,-1.073379968056573e+01};
-  static const double Xc_q[]={-1.156154685363075e+01, 5.011347178843301e+01,
-   -9.652115572123826e+01, 6.970392297095620e+01};
+  // XcPlus: asym_cut=0.0097, rpy_cut=0.4, p_min=3, n_p=4, n_q=3
+  static const double Xc_ac=9.7e-03, Xc_rc=4.0e-01;
+  static const double Xc_p[]={-6.769668477673338e-02, 4.251981921512744e-01,
+   -4.761218699317399e-01,-5.662068770688917e-01};
+  static const double Xc_q[]={-7.986015731409064e+00, 2.107903159501786e+01,
+   -1.836099133069141e+01};
   // YcPlus: asym_cut=0.0456, rpy_cut=5.0, p_min=3, n_p=5, n_q=4
   static const double Yc_ac=4.56e-02, Yc_rc=5.0;
   static const double Yc_p[]={ 4.774546185054501e-02,-1.200098819024352e+00,
@@ -189,7 +189,7 @@ static double delta_R_wall(int scalar, double eps, double h) {
     case 0:
       if (eps < Xa_ac) return asym_minus_rpy(0);
       if (eps > Xa_rc) return 0.0;
-      return eval_wall_rat(h,H,1,5,4,Xa_p,Xa_q);
+      return eval_wall_rat(h,H,1,3,4,Xa_p,Xa_q);
     case 1:
       if (eps < Ya_ac) return asym_minus_rpy(1);
       if (eps > Ya_rc) return 0.0;
@@ -201,7 +201,7 @@ static double delta_R_wall(int scalar, double eps, double h) {
     case 3:
       if (eps < Xc_ac) return asym_minus_rpy(3);
       if (eps > Xc_rc) return 0.0;
-      return eval_wall_rat(h,H,3,5,4,Xc_p,Xc_q);
+      return eval_wall_rat(h,H,3,4,3,Xc_p,Xc_q);
     default:
       if (eps < Yc_ac) return asym_minus_rpy(4);
       if (eps > Yc_rc) return 0.0;
@@ -248,15 +248,17 @@ void Lubrication::AssembleResistMatrix(Matrix &R, double mob_factor[3],
 // =============================================================================
 // Wall resistance matrices — rational fits (no table I/O)
 // =============================================================================
-Matrix Lubrication::WallResistMatrix(double r_norm, double mob_factor[3]) {
+
+// R_RPY wall correction matrix (6x6)
+Matrix Lubrication::WallResistMatrixMB(double r_norm, double mob_factor[3]) {
   double epsilon = r_norm - 1.0;
   if (epsilon < debye_cut) { epsilon = debye_cut; r_norm = 1.0 + epsilon; }
 
-  const double Xa_corr = rpy_wall(0,r_norm) + delta_R_wall(0,epsilon,r_norm);
-  const double Ya_corr = rpy_wall(1,r_norm) + delta_R_wall(1,epsilon,r_norm);
-  const double Yb      = rpy_wall(2,r_norm) + delta_R_wall(2,epsilon,r_norm);
-  const double XcPlus  = std::fmax(rpy_wall(3,r_norm) + delta_R_wall(3,epsilon,r_norm), 0.0);
-  const double YcPlus  = std::fmax(rpy_wall(4,r_norm) + delta_R_wall(4,epsilon,r_norm), 0.0);
+  const double Xa_corr = rpy_wall(0, r_norm);
+  const double Ya_corr = rpy_wall(1, r_norm);
+  const double Yb      = rpy_wall(2, r_norm);
+  const double XcPlus  = rpy_wall(3, r_norm);
+  const double YcPlus  = rpy_wall(4, r_norm);
 
   Matrix R(6,6);
   R << mob_factor[0]*Ya_corr, 0, 0, 0,  mob_factor[1]*Yb, 0,
@@ -268,24 +270,26 @@ Matrix Lubrication::WallResistMatrix(double r_norm, double mob_factor[3]) {
   return R;
 }
 
-Matrix Lubrication::WallResistMatrixMB(double r_norm, double mob_factor[3]) {
+// Delta_R wall correction matrix (6x6)
+// Each scalar is set to zero if epsilon > rpy_cut for that scalar.
+Matrix Lubrication::WallDeltaR(double r_norm, double mob_factor[3]) {
+  static const double rpy_cuts[5] = {7.0, 5.6, 3.4, 0.4, 5.0};  // Xa,Ya,Yb,Xc,Yc
+
   double epsilon = r_norm - 1.0;
   if (epsilon < debye_cut) { epsilon = debye_cut; r_norm = 1.0 + epsilon; }
 
-  // MB wall: pure RPY (no Delta_R correction)
-  const double Xa_corr = rpy_wall(0,r_norm);   // Xa - 1
-  const double Ya_corr = rpy_wall(1,r_norm);   // Ya - 1
-  const double Yb      = rpy_wall(2,r_norm);
-  const double XcPlus  = rpy_wall(3,r_norm);   // Xc - 4/3
-  const double YcPlus  = rpy_wall(4,r_norm);   // Yc - 4/3
+  double dR[5];
+  for (int s = 0; s < 5; ++s)
+    dR[s] = (epsilon > rpy_cuts[s]) ? 0.0
+                                    : delta_R_wall(s, epsilon, r_norm);
 
   Matrix R(6,6);
-  R << mob_factor[0]*Ya_corr, 0, 0, 0,  mob_factor[1]*Yb, 0,
-       0, mob_factor[0]*Ya_corr, 0, -mob_factor[1]*Yb, 0, 0,
-       0, 0, mob_factor[0]*Xa_corr, 0, 0, 0,
-       0, -mob_factor[1]*Yb, 0,  mob_factor[2]*YcPlus, 0, 0,
-       mob_factor[1]*Yb, 0, 0, 0,  mob_factor[2]*YcPlus, 0,
-       0, 0, 0, 0, 0,  mob_factor[2]*XcPlus;
+  R << mob_factor[0]*dR[1], 0, 0, 0,  mob_factor[1]*dR[2], 0,
+       0, mob_factor[0]*dR[1], 0, -mob_factor[1]*dR[2], 0, 0,
+       0, 0, mob_factor[0]*dR[0], 0, 0, 0,
+       0, -mob_factor[1]*dR[2], 0,  mob_factor[2]*dR[4], 0, 0,
+       mob_factor[1]*dR[2], 0, 0, 0,  mob_factor[2]*dR[4], 0,
+       0, 0, 0, 0, 0,  mob_factor[2]*dR[3];
   return R;
 }
 
@@ -520,8 +524,10 @@ Matrix Lubrication::ResistPairMB(double r_norm, double mob_factor[3],
 // ResistCSC: build sparse matrix, return as scipy CSC via nanobind
 // =============================================================================
 SpMat Lubrication::ResistCSC(nb::list r_vectors, nb::list n_list, double a,
-                              double eta, double cutoff, double wall_cutoff,
-                              nb_array_d periodic_length, bool Sup_if_true) {
+                              double eta, nb_array_d periodic_length,
+                              bool Sup_if_true) {
+  // Pair cutoff hardcoded to PAIR_CUTOFF (4.5a); wall corrections always
+  // applied to all particles — the rational fits decay smoothly to zero.
   int num_bodies = (int)r_vectors.size();
   int n_dof      = 6 * num_bodies;
   double mob_factor[3] = {6.0*M_PI*eta*a, 6.0*M_PI*eta*a*a, 6.0*M_PI*eta*a*a*a};
@@ -544,10 +550,14 @@ SpMat Lubrication::ResistCSC(nb::list r_vectors, nb::list n_list, double a,
     const nb_array_d &r_j = r_vecs_cast[j];
     height = r_j(2) / a;
 
-    if (height < wall_cutoff) {
-      R_wall = Sup_if_true
-        ? WallResistMatrix  (height, mob_factor)
-        : WallResistMatrixMB(height, mob_factor);
+    // Wall correction always applied — no cutoff check
+    {
+      Matrix R_rpy = WallResistMatrixMB(height, mob_factor);
+      if (Sup_if_true) {
+        R_wall = R_rpy + WallDeltaR(height, mob_factor);
+      } else {
+        R_wall = R_rpy;
+      }
       for (int row = 0; row < 6; row++)
         for (int col = 0; col < 6; col++) {
           double v = R_wall(row, col);
@@ -574,7 +584,7 @@ SpMat Lubrication::ResistCSC(nb::list r_vectors, nb::list n_list, double a,
       r_norm = r_jk.norm();
       r_hat  = -r_jk / r_norm;
 
-      if (r_norm < cutoff) {
+      if (r_norm < PAIR_CUTOFF) {  // hardcoded — fits valid only to 4.5a
         R_pair = Sup_if_true ? ResistPairSup(r_norm, mob_factor, r_hat)
                              : ResistPairMB (r_norm, mob_factor, r_hat);
         const int dof_r[4]={j*6,k*6,j*6,k*6}, dof_c[4]={j*6,k*6,k*6,j*6};
@@ -600,8 +610,9 @@ SpMat Lubrication::ResistCSC(nb::list r_vectors, nb::list n_list, double a,
 // =============================================================================
 std::pair<SpMat, SpMat>
 Lubrication::ResistCSC_both(nb::list r_vectors, nb::list n_list, double a,
-                             double eta, double cutoff, double wall_cutoff,
-                             nb_array_d periodic_length) {
+                             double eta, nb_array_d periodic_length) {
+  // Pair cutoff hardcoded to PAIR_CUTOFF (4.5a); wall corrections always
+  // applied to all particles.
   int num_bodies = (int)r_vectors.size();
   int n_dof      = 6 * num_bodies;
   double mob_factor[3] = {6.0*M_PI*eta*a, 6.0*M_PI*eta*a*a, 6.0*M_PI*eta*a*a*a};
@@ -635,12 +646,12 @@ Lubrication::ResistCSC_both(nb::list r_vectors, nb::list n_list, double a,
     const nb_array_d &r_j = r_vecs_cast[j];
     height = r_j(2) / a;
 
-    if (height < wall_cutoff) {
-      R_wall_sup = WallResistMatrix  (height, mob_factor);
-      R_wall_mb  = WallResistMatrixMB(height, mob_factor);
-      push_block(trip_sup, R_wall_sup, j*6, j*6);
-      push_block(trip_mb,  R_wall_mb,  j*6, j*6);
-    }
+    // Wall correction always applied to all particles — no cutoff check.
+    // The rational fits decay smoothly to zero in the far field.
+    R_wall_mb  = WallResistMatrixMB(height, mob_factor);
+    R_wall_sup = R_wall_mb + WallDeltaR(height, mob_factor);
+    push_block(trip_sup, R_wall_sup, j*6, j*6);
+    push_block(trip_mb,  R_wall_mb,  j*6, j*6);
 
     const nb_array_i &neighbors = n_list_cast[j];
     int num_neighbors = (int)neighbors.size();
@@ -660,7 +671,7 @@ Lubrication::ResistCSC_both(nb::list r_vectors, nb::list n_list, double a,
       r_norm = r_jk.norm();
       r_hat  = -r_jk / r_norm;
 
-      if (r_norm < cutoff) {
+      if (r_norm < PAIR_CUTOFF) {  // hardcoded — fits valid only to 4.5a
         R_sup = ResistPairSup(r_norm, mob_factor, r_hat);
         R_mb  = ResistPairMB (r_norm, mob_factor, r_hat);
 
@@ -698,10 +709,10 @@ NB_MODULE(lubrication, m) {
            "Construct with Debye cutoff distance.")
       .def("ResistCSC", &Lubrication::ResistCSC,
            "r_vectors"_a, "n_list"_a, "a"_a, "eta"_a,
-           "cutoff"_a, "wall_cutoff"_a, "periodic_length"_a, "Sup_if_true"_a,
+           "periodic_length"_a, "Sup_if_true"_a,
            "Returns a scipy CSC sparse matrix of the lubrication resistance.")
       .def("ResistCSC_both", &Lubrication::ResistCSC_both,
            "r_vectors"_a, "n_list"_a, "a"_a, "eta"_a,
-           "cutoff"_a, "wall_cutoff"_a, "periodic_length"_a,
+           "periodic_length"_a,
            "Returns (R_MB, R_Sup) as scipy CSC matrices in a single pair loop.");
 }
