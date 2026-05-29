@@ -10,7 +10,7 @@ Particles are single-blob rigid bodies.  Forces include:
   - Pair magnetic dipole interactions (in-plane rotating field)
   - Pair electric-field-induced dipole interactions (static z field)
   - Pair steric repulsion (firm contact + soft Yukawa)
-  - External magnetic torque (B × m)
+  - External magnetic torque (B X m)
 
 Each n_plot steps a snapshot PNG is saved showing particles as 2-D discs
 with an orientation arrow (projection of the body x-axis into the xy plane).
@@ -21,7 +21,7 @@ to drive the chain-to-ring transition.
 
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..', 'src'))
 
 import numpy as np
 import matplotlib
