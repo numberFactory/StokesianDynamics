@@ -33,13 +33,14 @@ class pyStokesianDynamics(object):
         self.a               = a
         self.kT              = 0.0041419464
         self.dt              = 1.0
-        self.cutoff           = 4.5 # DO NOT CHANGE, FITS ARE HARD-CODED TO THIS VALUE
+        self.cutoff          = 4.5 # DO NOT CHANGE, FITS ARE HARD-CODED TO THIS VALUE
         self.debye_length    = debye_length
 
         self.Delta_R  = None
         self.R_MB     = None
         self.R_Sup    = None
         self.isolated = []   # particles far from wall and all neighbours
+        self.vel_last = None
 
         self.LC = Lubrication(debye_length)
 
@@ -301,7 +302,7 @@ class pyStokesianDynamics(object):
 
         # ── predictor solve ───────────────────────────────────────────────
         _t0   = time.perf_counter()
-        vel_p = self.Lubrication_solve(X=Mhalf, Xm=FT, print_residual=print_residual)
+        vel_p = self.Lubrication_solve(X=Mhalf, Xm=FT, X0=self.vel_last, print_residual=print_residual)
         self.timings['solve_pred'] += time.perf_counter() - _t0
 
         # update current slots from _old + predictor velocity
@@ -328,6 +329,7 @@ class pyStokesianDynamics(object):
         RHS_X_C = (D_M + Mhalf) if stochastic else None
         _t0   = time.perf_counter()
         vel_c = self.Lubrication_solve(X=RHS_X_C, Xm=FT_C, X0=vel_p, print_residual=print_residual)
+        self.vel_last = vel_c
         self.timings['solve_corr'] += time.perf_counter() - _t0
 
         # trapezoidal average → write into _new slots
