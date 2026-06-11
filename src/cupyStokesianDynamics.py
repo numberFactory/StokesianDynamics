@@ -67,6 +67,15 @@ class cupyStokesianDynamics:
         self.Delta_R = None
         self.isolated = []
 
+        # Initialize perturbation matrix diagonal
+        small_F = 6.0 * cp.pi * self.eta * self.a       * self.tolerance
+        small_T = 8.0 * cp.pi * self.eta * self.a**3    * self.tolerance
+        self.small_diag = cp.tile(
+            cp.array([small_F, small_F, small_F,
+                    small_T, small_T, small_T]),
+            len(self.bodies)
+        )
+
         # GPU Cholesky preconditioner for R_Sup
         self._chol_pc = None
 
@@ -188,7 +197,6 @@ class cupyStokesianDynamics:
         r_gpu = self.put_r_vecs_in_periodic_box_gpu(r_gpu)
         N     = r_gpu.shape[0]
         n_dof = 6 * N
-        small = 0.5 * 6.0 * np.pi * self.eta * self.a * self.tolerance
 
         neighbors   = self._build_neighbour_list(r_gpu)
         r_vecs_list = [r_gpu[j].get() for j in range(N)]   # fast-path fallback
@@ -199,18 +207,17 @@ class cupyStokesianDynamics:
             k_gpu=self._k_gpu, pl_gpu=self._pl_gpu)
 
         if R_MB_gpu.nnz == 0:
-            R_MB_gpu  = cpsp.diags(cp.full(n_dof, small), 0, format='csc')
+            R_MB_gpu  = cpsp.diags(self.small_diag, 0, format='csc')
         if R_Sup_gpu.nnz == 0:
-            R_Sup_gpu = cpsp.diags(cp.full(n_dof, small), 0, format='csc')
+            R_Sup_gpu = cpsp.diags(self.small_diag, 0, format='csc')
 
         self.R_MB    = R_MB_gpu
         self.R_Sup   = R_Sup_gpu
         self.Delta_R = R_Sup_gpu - R_MB_gpu
 
         # ── GPU Cholesky preconditioner (cuDSS) ───────────────────────────
-        small_pc      = 6.0 * np.pi * self.eta * self.a * self.tolerance
         R_Sup_shifted = R_Sup_gpu + cpsp.diags(
-            cp.full(n_dof, small_pc), 0, format='csc')
+            self.small_diag, 0, format='csc')
         self._chol_pc = CholeskySolver(R_Sup_shifted.tocsr())
 
         # ── CPU CHOLMOD factor for Delta_R^{1/2} ──────────────────────────
@@ -219,9 +226,9 @@ class cupyStokesianDynamics:
              self.Delta_R.indices.get(),
              self.Delta_R.indptr.get()),
             shape=(n_dof, n_dof))
-        small_dr = 1e-5 * 6.0 * np.pi * self.eta * self.a
+
         Delta_R_shifted_cpu = Delta_R_cpu + sp.diags(
-            small_dr * np.ones(n_dof), 0, format='csc')
+            self.small_diag, 0, format='csc')
 
         if (self._chol_dr_sym is None or
                 Delta_R_shifted_cpu.shape != self._chol_dr_sym.D().shape):
@@ -255,12 +262,13 @@ class cupyStokesianDynamics:
         GPU cuDSS Cholesky — stays entirely on device.
         """
         RHS_gpu = self.R_MB @ X_gpu
-        for k in self.isolated:
-            RHS_gpu[6*k:6*k+6] = 0.0
         Y_gpu = self._chol_pc.solve(RHS_gpu)
-        for k in self.isolated:
-            Y_gpu[6*k:6*k+6] = X_gpu[6*k:6*k+6]
-        return Y_gpu
+        # for k in self.isolated:
+        #     RHS_gpu[6*k:6*k+6] = 0.0
+        # Y_gpu = self._chol_pc.solve(RHS_gpu)
+        # for k in self.isolated:
+        #     Y_gpu[6*k:6*k+6] = X_gpu[6*k:6*k+6]
+        # return Y_gpu
 
     # =========================================================================
     # GMRES solve

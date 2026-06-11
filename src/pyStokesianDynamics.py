@@ -42,6 +42,16 @@ class pyStokesianDynamics(object):
         self.isolated = []   # particles far from wall and all neighbours
         self.vel_last = None
 
+        # Initialize perturbation matrix diagonal
+        small_F = 6.0 * np.pi * self.eta * self.a          *self.tolerance
+        small_T = 8.0 * np.pi * self.eta * self.a**3       *self.tolerance
+
+        self.small_diag = np.tile(
+            np.array([small_F, small_F, small_F,
+                    small_T, small_T, small_T]),
+            len(self.bodies)
+        )
+
         self.LC = Lubrication(debye_length)
 
         # Initialise libMobility solver
@@ -107,7 +117,6 @@ class pyStokesianDynamics(object):
         r_vecs = [np.asarray(r, dtype=np.float64) for r in r_vecs]
 
         num_particles = len(r_vecs)
-        small = 0.5 * 6.0 * np.pi * self.eta * self.a * self.tolerance
 
         self.solver.setPositions(np.array(r_vecs).flatten())
 
@@ -129,9 +138,9 @@ class pyStokesianDynamics(object):
             r_vecs, neighbors, self.a, self.eta, self.periodic_length)
 
         if self.R_MB.nnz == 0:
-            self.R_MB  = sp.diags(small * np.ones(6 * num_particles), 0, format='csc')
+            self.R_MB  = sp.diags(self.small_diag, 0, format='csc')
         if self.R_Sup.nnz == 0:
-            self.R_Sup = sp.diags(small * np.ones(6 * num_particles), 0, format='csc')
+            self.R_Sup = sp.diags(self.small_diag, 0, format='csc')
 
         self.Delta_R = self.R_Sup - self.R_MB
 
@@ -168,11 +177,12 @@ class pyStokesianDynamics(object):
         which return X unchanged.
         '''
         RHS = self.R_MB.dot(X)
-        for k in self.isolated:
-            RHS[6*k:6*k+6] = 0.0
         Y_F = R_fact(RHS)
-        for k in self.isolated:
-            Y_F[6*k:6*k+6] = X[6*k:6*k+6]
+        # for k in self.isolated:
+        #     RHS[6*k:6*k+6] = 0.0
+        # Y_F = R_fact(RHS)
+        # for k in self.isolated:
+        #     Y_F[6*k:6*k+6] = X[6*k:6*k+6]
         return Y_F
 
     def Lubrication_solve(self, X, Xm, X0=None, print_residual=False, its_out=1000):
@@ -196,9 +206,7 @@ class pyStokesianDynamics(object):
         if RHS_norm > 0:
             RHS = RHS / RHS_norm
 
-        small           = 6.0 * np.pi * self.eta * self.a * self.tolerance
-        Eig_Shift_R_Sup = self.R_Sup + sp.diags(
-            small * np.ones(6 * num_particles), 0, format='csc')
+        Eig_Shift_R_Sup = self.R_Sup + sp.diags(self.small_diag, 0, format='csc')
         
         factor = cholesky(Eig_Shift_R_Sup)
 
@@ -217,7 +225,7 @@ class pyStokesianDynamics(object):
         U_gmres, info = pyamg.krylov.fgmres(
             A, RHS, x0=X0, tol=self.tolerance, M=PC,
             maxiter=min(its_out, A.shape[0]),
-            restart=min(100, A.shape[0]),
+            restart=min(300, A.shape[0]),
             residuals=res_list)
 
         if RHS_norm > 0:
@@ -243,9 +251,8 @@ class pyStokesianDynamics(object):
         prefactor           = np.sqrt(2.0 * self.kT / self.dt)
 
         # Delta_R^{1/2} * W1 via Cholesky of shifted Delta_R
-        small        = 1.0e-5 * 6.0 * np.pi * self.eta * self.a
         Eig_Shift_DR = self.Delta_R + sp.diags(
-            small * np.ones(Dim), 0, format='csc')
+            self.small_diag, 0, format='csc')
 
 
         factor  = cholesky(Eig_Shift_DR)
@@ -389,8 +396,8 @@ class pyStokesianDynamics(object):
             r    = self.project_to_periodic_image(
                 b.location_new - b.location_old, self.periodic_length)
             disp = np.linalg.norm(r)
-            if disp > 2 * self.a:
-                print(f"Rejected timestep: large jump ({disp:.4f} > {2*self.a:.4f}).")
+            if disp > 4.0 * self.a:
+                print(f"Rejected timestep: large jump ({disp:.4f} > {4*self.a:.4f}).")
                 return 0, 1
 
         return 0, 0

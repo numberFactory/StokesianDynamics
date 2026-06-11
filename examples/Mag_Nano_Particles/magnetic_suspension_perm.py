@@ -49,21 +49,21 @@ def main():
 # =============================================================================
 
     # ── Physical parameters ───────────────────────────────────────────────────
-    a   = 1.045            # particle radius (µm)
-    eta = 8.9e-4         # fluid viscosity (Pa·s)
+    a   = 0.1 #25            # particle radius (µm)
+    eta = 1.0e-3         # fluid viscosity (Pa·s)
     kbt = 0.0041419464   # thermal energy kT (pN·µm)
     Stoch = True        # Brownian motion on/off
 
     # ── Sedimentation: mg = 2*kbt ─────────────────────────────────────────────
     # g here is the net gravitational force (buoyancy-corrected) in pN
-    g = 0.0303 #2.83e-4
-    g_place = 0.0303   # stronger gravity for placement to reduce initial z_max
+    g = 2.83e-4
+    g_place = 0.01   # stronger gravity for placement to reduce initial z_max
 
     # ── Magnetic parameters (permanent moment only) ───────────────────────────
     # mu_dipole = 2e-15 A·m^2 = 2 aJ/mT
-    mu_dipole = 0.5 #2.0          # permanent dipole magnitude (aJ/mT)
+    mu_dipole = 0.5          # permanent dipole magnitude (aJ/mT)
     B_0       = 3.0         # rotating field amplitude (mT)
-    B_freq    = 9.0         # rotation frequency (Hz)
+    B_freq    = 900.0         # rotation frequency (Hz)
     # Coupling constant C = (3/(4*pi)) * mu0 * mu_dipole^2 / (r)^4
     # With mu_dipole in aJ/mT, distances in µm, forces in pN:
     # C ~ (3/(4*pi))* (1 attoJoule /millitesla )^2 * (4*pi*1e-7 Henry/m) / (1 um)^4 to pN
@@ -73,29 +73,30 @@ def main():
     # ── No induced moment — C_z removed entirely ─────────────────────────────
 
     # ── Interaction / steric parameters ──────────────────────────────────────
-    firm_delta     = 1e-2
+    firm_delta     = 1e-3
     debye_firm     = 2.0 * a * firm_delta / np.log(10.0)
     repulsion_firm = 8.0 * kbt               # firm repulsion strength
     repulsion_soft = 0.0
     debye_soft     = 0.1 * a
 
     # ── Box geometry from packing fraction and N ──────────────────────────────
-    N    = 1000
-    phi  = 0.4
+    N    = 2000
+    phi  = 0.05
     # phi = N * (4/3 pi a^3) / (Lx * Ly * z_max)
     # Choose Lx = Ly = L_xy (square cross-section), z_max = 10*(2a)
-    z_max_particles = 6.0 * (2.0 * a)         # initial guess: 10 diameters
+    z_max_particles = 20.0 * (2.0 * a)         # initial guess: 10 diameters
     A_box   = N * np.pi * a**2 / phi
     L_xy    = float(np.sqrt(A_box))
     print(f"N={N}, phi={phi:.2f}")
     print(f"Box: Lx=Ly={L_xy:.4f} µm,  z_max={z_max_particles:.4f} µm")
 
-    L             = np.array([L_xy, L_xy, 0.0])   # periodic in x,y; open in z
+    #L             = np.array([L_xy, L_xy, 0.0])   # periodic in x,y; open in z
+    L             = np.array([0.0, 0.0, 0.0])
     z_max_solver  = z_max_particles                # SD solver cutoff
 
     # ── Time parameters ───────────────────────────────────────────────────────
     t_end   = 10.0              # stop time (s)
-    dt      = 1.0e-2 #0.01 / B_freq    # 1% of rotation period
+    dt      = 2e-6 #0.01 / B_freq    # 1% of rotation period
     n_steps = int(t_end / dt)
     n_plot       = 100   # 3-D pyvista snapshot every n_plot steps
     n_vel        = 50    # particle velocity diagnostics every n_vel steps
@@ -108,19 +109,19 @@ def main():
 
     # ── Rotating field — rotates in the yz plane ──────────────────────────────
     def m_rot_fn(t):
-        return np.array([0.0,
-                         np.cos(2 * np.pi * B_freq * t),
+        return np.array([np.cos(2 * np.pi * B_freq * t),
+                         0.0,
                          np.sin(2 * np.pi * B_freq * t)])
 
     # ── Place particles ───────────────────────────────────────────────────────
     print("Placing particles ...")
     t0_place = time.perf_counter()
-    positions = place_particles(N, a, kbt, g_place, L_xy, L_xy, seed=42)
+    positions = place_particles(N, a, kbt, g_place, 0.99*L_xy, 0.99*L_xy, seed=42)
     print(f"  done in {time.perf_counter()-t0_place:.1f}s  "
           f"z range: [{positions[:,2].min():.4f}, {positions[:,2].max():.4f}] µm")
 
     # Random orientations
-    rng = np.random.default_rng(99)
+    rng = np.random.default_rng()
     bodies = []
     for pos in positions:
         q = rng.standard_normal(4)
@@ -190,12 +191,40 @@ def main():
                   f"mean={speeds.mean():.4e}  "
                   f"elapsed={elapsed:.1f}s")
 
-        # ── 3-D pyvista snapshot ──────────────────────────────────────────────
+        # ── 3-D pyvista snapshot + data output ───────────────────────────────
         if step % n_plot == 0:
+            speeds  = np.linalg.norm((r_after - r_before) / dt, axis=1)
             elapsed = time.perf_counter() - t_wall
             print(f"  [plot] step={step:7d}/{n_steps}  t={t_sim:.4f}s  "
                   f"z_max={z_max_now:.4f}  elapsed={elapsed:.1f}s")
-            plot_frame_3d(bodies, a, L, frame_idx, t_sim, out_dir)
+            plot_frame_3d(bodies, speeds, a, L_xy, L, frame_idx, t_sim, out_dir)
+
+            # r_vectors — shape (N, 3)
+            np.savetxt(
+                os.path.join(out_dir, f'r_vectors_{frame_idx:07d}.txt'),
+                r_after,
+                header='x y z',
+                fmt='%.8e',
+            )
+
+            # velocities:
+            vels = (r_after - r_before) / dt
+            np.savetxt(
+                os.path.join(out_dir, f'vels_{frame_idx:07d}.txt'),
+                vels,
+                header='Vx Vy Vz',
+                fmt='%.8e',
+            )
+
+            # x-column of each rotation matrix — shape (N, 3)
+            R_x = np.array([b.orientation.as_matrix()[:, 0] for b in bodies])
+            np.savetxt(
+                os.path.join(out_dir, f'orientation_x_{frame_idx:07d}.txt'),
+                R_x,
+                header='Rx_x Rx_y Rx_z',
+                fmt='%.8e',
+            )
+
             frame_idx += 1
 
     print(f"\nSimulation complete in {time.perf_counter()-t_wall:.1f}s")
@@ -249,6 +278,21 @@ def force_torque_calculator(bodies, r_vecs, **kwargs):
         rep_soft, deb_soft,
         C,
     )
+
+    # # check for large forces and overlapping particles
+    # for i in range(N):
+    #     f_mag = np.linalg.norm(force[i])
+    #     if f_mag > 1e3:
+    #         print(f"WARNING: large force on particle {i}: {f_mag:.4e} pN")
+    #     for j in range(i+1, N):
+    #         dr = r[j] - r[i]
+    #         for k in range(3):
+    #             if L[k] > 0:
+    #                 dr[k] -= round(dr[k] / L[k]) * L[k]
+    #         r_norm = np.linalg.norm(dr)
+    #         if r_norm < 2.0 * a:
+    #             print(f"WARNING: particles {i} and {j} are overlapping "
+    #                   f"(r={r_norm:.4e} µm)")
 
     FT = np.zeros((2 * N, 3))
     FT[0::2] = force
@@ -406,11 +450,11 @@ def compute_tracer_velocities(solver, r_vecs_flat, Lambda_s, tracer_points):
 # =============================================================================
 # Visualisation — pyvista 3-D spheres
 # =============================================================================
-def plot_frame_3d(bodies, a, L, frame_idx, t_sim, out_dir):
+def plot_frame_3d(bodies, speeds, a, L_xy, L, frame_idx, t_sim, out_dir):
     """
     Render particles as spheres above z=0 using pyvista.
     Particles are wrapped periodically into [0,Lx] x [0,Ly].
-    Colour encodes height z.
+    Colour encodes speed. Three-point lighting with shadow casting.
     """
     if not HAS_PYVISTA:
         print("pyvista not available — skipping 3-D plot.")
@@ -427,41 +471,94 @@ def plot_frame_3d(bodies, a, L, frame_idx, t_sim, out_dir):
 
     cloud = pv.PolyData(locs)
     cloud['z_height'] = locs[:, 2]
+    cloud['speeds']   = speeds
+
     spheres = cloud.glyph(
-        geom=pv.Sphere(radius=a, theta_resolution=12, phi_resolution=12),
+        geom=pv.Sphere(radius=a, theta_resolution=24, phi_resolution=24),
         scale=False,
         orient=False,
     )
 
-    pl = pv.Plotter(off_screen=True, window_size=(1200, 900))
-    pl.set_background('white')
+    z_cam = 3.5 #locs[:, 2].max() + 0 * a
 
-    # floor plane at z = 0
-    floor = pv.Plane(
-        center=(Lx / 2, Ly / 2, 0.0),
-        direction=(0, 0, 1),
-        i_size=Lx, j_size=Ly,
-        i_resolution=1, j_resolution=1,
+    pl = pv.Plotter(off_screen=True, window_size=(1200, 900),
+                    lighting='none')
+    pl.set_background('black')
+
+    # ── Lighting — positional light required for shadow casting ───────────────
+    # Key light: high, to the left, positional so shadows are cast
+    key = pv.Light(
+        position=(L_xy * 0.0, -L_xy * 0.5, z_cam * 5.0),
+        focal_point=(L_xy / 2, L_xy / 2, 0.0),
+        color='white',
+        intensity=1.0,
+        positional=True,
+        cone_angle=60,
+        exponent=2,
     )
-    pl.add_mesh(floor, color='lightgrey', opacity=0.5)
+    pl.add_light(key)
+
+    # Fill light: softer, from the right — camera-type so no shadow from this
+    fill = pv.Light(
+        position=(L_xy * 2.0, L_xy * 1.0, z_cam * 2.0),
+        focal_point=(L_xy / 2, L_xy / 2, z_cam / 2),
+        color='white',
+        intensity=0.35,
+        light_type='camera light',
+    )
+    pl.add_light(fill)
+
+    # Rim light: cool tint from behind, traces silhouettes
+    rim = pv.Light(
+        position=(L_xy / 2, L_xy * 2.5, -z_cam * 0.3),
+        focal_point=(L_xy / 2, L_xy / 2, z_cam / 2),
+        color='lightblue',
+        intensity=0.2,
+        light_type='camera light',
+    )
+    pl.add_light(rim)
+
+    # ── Enable shadows — must come before add_mesh ────────────────────────────
+    pl.enable_shadows()
+
+    # ── Floor plane ───────────────────────────────────────────────────────────
+    floor = pv.Plane(
+    center=(L_xy / 2, L_xy / 2, 0.0),
+    direction=(0, 0, 1),
+    i_size=L_xy * 3.0,    # 3x larger than domain
+    j_size=L_xy *1.4,
+    i_resolution=200, j_resolution=200,
+)
+    pl.add_mesh(floor, color='#cccccc', opacity=1.0,
+                ambient=0.3, diffuse=0.7, specular=0.1)
+
+    # ── Spheres ───────────────────────────────────────────────────────────────
+    c_low  = max(0.0, speeds.mean() - 2 * speeds.std())
+    c_high = speeds.mean() + 2 * speeds.std()
 
     pl.add_mesh(
         spheres,
-        scalars='z_height',
-        cmap='coolwarm',
-        clim=[0.0, locs[:, 2].max() + a],
+        scalars='speeds',
+        cmap='plasma',
+        clim=[c_low, c_high],
         show_scalar_bar=True,
-        scalar_bar_args={'title': 'z (µm)'},
+        scalar_bar_args={'title': '|V| (µm/s)', 'color': 'white'},
+        ambient=0.1,
+        diffuse=0.7,
+        specular=0.5,
+        specular_power=40,
+        smooth_shading=True,
     )
 
-    z_cam = locs[:, 2].max() + 4 * a
+    # ── Camera ────────────────────────────────────────────────────────────────
     pl.camera_position = [
-        (Lx / 2, -Ly * 1.5, z_cam * 3),
-        (Lx / 2,  Ly / 2,   z_cam / 2),
+        (L_xy / 2, -0.3 * L_xy * 1.5, z_cam * 3),
+        (L_xy / 2,  0.3 * L_xy / 2,   z_cam / 2),
         (0, 0, 1),
     ]
+
     pl.add_title(f't = {t_sim:.4f} s   z_max = {locs[:,2].max():.3f} µm',
-                 font_size=14)
+                 font_size=14, color='white')
 
     fname = os.path.join(out_dir, f'frame3d_{frame_idx:07d}.png')
     pl.screenshot(fname)

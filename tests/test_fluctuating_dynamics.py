@@ -60,7 +60,7 @@ def main():
     z_max_solver = 2.0 * (2.0 * a)
 
     # ── Packing fraction ──────────────────────────────────────────────────────
-    phi = 0.34
+    phi = 0.66
     N   = max(1, int(phi * Lx * Ly / (np.pi * a**2)))
 
     # ── Simulation parameters ─────────────────────────────────────────────────
@@ -143,7 +143,8 @@ def main():
             nl_rebuilds += 1
 
         np.savez('debug_positions.npz', step=step, time=step*dt, positions=r_now)
-        solver.Update_Bodies_Trap(FT_calc, stochastic=True)
+        solver.Update_Bodies_Trap(FT_calc, stochastic=True, print_residual=False)
+        #solver.print_timings()
 
         if step % n_save == 0:
             frame_idx += 1
