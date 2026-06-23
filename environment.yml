@@ -2,11 +2,22 @@ name: lubrication
 channels:
   - conda-forge
 dependencies:
+  # Pin Python — nvmath-python requires <=3.13, and 3.12 has the broadest
+  # compatibility across the scientific stack
+  - python=3.12
+
   # Core numerics
   - numpy
   - scipy
   - matplotlib
   - libMobility
+  - scikit-sparse
+
+  # GPU — CuPy and nvmath-python (wraps cuDSS for sparse GPU solvers)
+  # nvmath-python requires cuda-version pin to pull in the right cudss wheel
+  - cupy
+  - cuda-version=12
+  - nvmath-python
 
   # JIT compilation for Python numerical kernels
   - numba
