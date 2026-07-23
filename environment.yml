@@ -39,3 +39,4 @@ dependencies:
   - pip
   - pip:
     - pyvista       # for 3D visualization (not on conda-forge consistently)
+    - -e .
