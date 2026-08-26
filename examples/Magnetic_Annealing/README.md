@@ -55,4 +55,4 @@ pushed high at once.
   solved self-consistently via GMRES, accounting for every particle's
   field on every other — more physically complete, notably more expensive
   per step.
-- **`phi`** — target areal packing fraction, used with `N` to size the box.
+- **`phi`** — target area packing fraction for initialization only
