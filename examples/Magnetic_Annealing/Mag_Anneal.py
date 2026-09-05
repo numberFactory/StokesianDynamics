@@ -39,12 +39,21 @@ from pyStokesianDynamics import pyStokesianDynamics
 
 
 # =============================================================================
-def main():
+def main(restart_dir=None, restart_index=None):
 # =============================================================================
 
     # TODO: Plot induce moment as well as the scaled external field (what you would get without mutual polarizability) to see how much the mutual polarizability is affecting the induced moment.
     # Check, after ring is formed, can z be turned off? Try with and without permanent dipole moment. 
     # # # i.e Start with the ring formed, then turn off the z field and see if it stays in the ring configuration. Try with and without permanent dipole moment.
+
+    # restart_dir, restart_index: if both given, particle positions and
+    # orientations are read from restart_dir/config_{restart_index:07d}.txt
+    # (see load_configuration) instead of being freshly placed. ONLY
+    # position/orientation come from that file -- every physical/field/
+    # simulation parameter below (N, a, B_0, dt, ...) still comes from
+    # THIS call's own settings, not from whatever was used to produce
+    # restart_dir. If the loaded configuration's particle count doesn't
+    # match N below, this raises rather than silently truncating/padding.
 
     # ── Physical parameters ───────────────────────────────────────────────────
     a   = 2.25          # particle radius (µm)
@@ -119,8 +128,9 @@ def main():
     L            = np.array([0.0, 0.0, 0.0])
     z_max_solver = 2.0 * (2.0 * a)
 
-    # ── Initial positions and orientations (from suspension_ladder_N_6_random.clones)
-    # Format: x y z qw qx qy qz  (scalar-first quaternion)
+    # ── Initial positions and orientations ────────────────────────────────────
+    # Format on disk (see save_configuration/load_configuration): x y z qw
+    # qx qy qz, scalar-first quaternion.
     # ── Place particles ───────────────────────────────────────────────────────
     N = 1000
     phi = 0.6
@@ -129,28 +139,34 @@ def main():
     print(f"N={N}, phi={phi:.2f}")
     print(f"Box: Lx=Ly={L_xy:.4f} µm")
 
-
-    print("Placing particles ...")
-    t0_place = time.perf_counter()
-    g_place = g
-    positions = place_particles(N, a, kT, g_place, 0.99*L_xy, 0.99*L_xy, seed=42)
-    print(f"  done in {time.perf_counter()-t0_place:.1f}s  "
-          f"z range: [{positions[:,2].min():.4f}, {positions[:,2].max():.4f}] µm")
-
-    # Random orientations
-    rng = np.random.default_rng()
-    bodies = []
-    for pos in positions:
-        theta_z = rng.uniform(0.0, 2.0 * np.pi)
-        ori = Rotation.from_euler('z', theta_z)
-        bodies.append(Body(location=pos.copy(), orientation=ori))
-
-    # ── Output ────────────────────────────────────────────────────────────────
-    if Stoch:
-        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mag_anneal_N_'+str(N)+'_stochastic_frames')
+    if restart_dir is not None:
+        print(f"Restarting from {restart_dir}, config index {restart_index} "
+              f"-- ONLY position/orientation are read from it; every physical/"
+              f"field/simulation parameter above and below still comes from "
+              f"this call's own settings.")
+        positions, orientations = load_configuration(restart_dir, restart_index)
+        if len(positions) != N:
+            raise ValueError(
+                f"Restart configuration at {restart_dir} (index {restart_index}) "
+                f"has {len(positions)} particles, but N={N} above. Set N to "
+                f"match, or restart from a different configuration.")
+        bodies = [Body(location=pos.copy(), orientation=ori)
+                  for pos, ori in zip(positions, orientations)]
     else:
-        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mag_anneal_N_'+str(N)+'_frames')
-    os.makedirs(out_dir, exist_ok=True)
+        print("Placing particles ...")
+        t0_place = time.perf_counter()
+        g_place = g
+        positions = place_particles(N, a, kT, g_place, 0.99*L_xy, 0.99*L_xy, seed=42)
+        print(f"  done in {time.perf_counter()-t0_place:.1f}s  "
+              f"z range: [{positions[:,2].min():.4f}, {positions[:,2].max():.4f}] µm")
+
+        # Random orientations
+        rng = np.random.default_rng()
+        bodies = []
+        for pos in positions:
+            theta_z = rng.uniform(0.0, 2.0 * np.pi)
+            ori = Rotation.from_euler('z', theta_z)
+            bodies.append(Body(location=pos.copy(), orientation=ori))
 
     # ── Rotating field direction (user-defined function of time) ─────────────
     # m_rot_fn(t_sim) must return a 3-vector giving the field direction.
@@ -161,7 +177,7 @@ def main():
         return np.array([np.cos(2 * np.pi * B_freq   * t),
                          np.sin(2 * np.pi * B_freq_y * t),
                          0.0])
-    
+
     # ── Simulation parameters ─────────────────────────────────────────────────
     dt      = 0.025*(1/B_freq_y) #6.25e-5   # timestep (s)
     n_steps = int(t_end / dt)
@@ -169,6 +185,31 @@ def main():
     solver_tolerance = 5e-3
 
     print(f"N = {N} particles, dt = {dt}, n_steps = {n_steps}, t_end = {t_end} s")
+
+    # ── Output ────────────────────────────────────────────────────────────────
+    # Labeled by exactly the parameters requested: N, B_0, B_freq, B_freq_y,
+    # dt, Stoch, mutual_polarizability_mag. A restart run gets "_restart"
+    # appended to THIS run's own label (built from its own current
+    # parameters, per above) -- never the source directory's label, even if
+    # they happen to differ (e.g. restarting at a different B_0).
+    label = (f"mag_anneal_N{N}_B0_{B_0:g}_Bfreq_{B_freq:g}_Bfreqy_{B_freq_y:g}"
+             f"_dt_{dt:.4g}_stoch_{Stoch}_mutualpol_{mutual_polarizability_mag}")
+    if restart_dir is not None:
+        label += "_restart"
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), label)
+    os.makedirs(out_dir, exist_ok=True)
+
+    if restart_dir is not None:
+        # Provenance marker: a file named after the SOURCE directory (not
+        # this run's own out_dir), so `ls` on out_dir immediately shows
+        # where it was restarted from. Content is a bonus, not the point --
+        # the filename itself is the record.
+        source_name = os.path.basename(os.path.normpath(restart_dir))
+        marker_path = os.path.join(out_dir, source_name + '.txt')
+        with open(marker_path, 'w') as f:
+            f.write(f"Restarted from directory: {os.path.abspath(restart_dir)}\n")
+            f.write(f"Configuration index used: {restart_index}\n")
+        print(f"  Restart source recorded -> {marker_path}")
 
     # ── Initialise solver ─────────────────────────────────────────────────────
     solver = pyStokesianDynamics(
@@ -306,6 +347,7 @@ def main():
 
             plot_frame(bodies, a, frame_idx, t_sim, B_z, out_dir,
                        B_applied=B_applied_now, induced_mom=induced_mom_now, RB_0=RB_0)
+            save_configuration(bodies, frame_idx, out_dir)
             frame_idx += 1
 
     if use_neighbor_list:
@@ -517,6 +559,55 @@ def place_particles(N, a, kT, g, Lx, Ly, seed=42,
         print(f"Placement: z_mean increased {total_z_increases} times "
               f"(final z_mean = {z_mean:.4f})")
     return positions
+
+
+# =============================================================================
+# Configuration (position + orientation) I/O, for movie-frame-synced
+# snapshots and for restarting a run from one of them
+# =============================================================================
+def save_configuration(bodies, frame_idx, out_dir):
+    """
+    Write every body's position and orientation to
+    out_dir/config_{frame_idx:07d}.txt -- same {frame_idx:07d} zero-padding
+    plot_frame already uses for frame_{frame_idx:07d}.png, so a config file
+    and its corresponding movie frame always share the same number.
+
+    One row per body: x y z qw qx qy qz -- scalar-first quaternion, matching
+    this project's own established clones-file convention (see the format
+    comment near where bodies are built in main()). scipy's own .as_quat()
+    returns scalar-LAST ([qx,qy,qz,qw]); reordered here to scalar-first
+    before writing.
+    """
+    rows = []
+    for b in bodies:
+        pos = b.location
+        qx, qy, qz, qw = b.orientation.as_quat()
+        rows.append([pos[0], pos[1], pos[2], qw, qx, qy, qz])
+    path = os.path.join(out_dir, f'config_{frame_idx:07d}.txt')
+    np.savetxt(path, rows, header='x y z qw qx qy qz', fmt='%.10e')
+    return path
+
+
+def load_configuration(config_dir, frame_idx):
+    """
+    Read ONLY position and orientation back from
+    config_dir/config_{frame_idx:07d}.txt (as written by
+    save_configuration) -- deliberately does not read or return anything
+    else, so restarting a run always uses the CURRENT call's own physical/
+    field/simulation parameters (N, a, B_0, dt, ...), never whatever
+    parameters produced config_dir.
+
+    Returns (positions, orientations): positions as an (N,3) array,
+    orientations as a list of N scipy Rotation objects (reconstructed from
+    the scalar-first qw,qx,qy,qz columns via Rotation.from_quat, which
+    itself wants scalar-LAST [qx,qy,qz,qw] -- reordered on the way in, the
+    reverse of save_configuration's reordering on the way out).
+    """
+    path = os.path.join(config_dir, f'config_{frame_idx:07d}.txt')
+    data = np.loadtxt(path, ndmin=2)
+    positions = data[:, 0:3]
+    orientations = [Rotation.from_quat([row[4], row[5], row[6], row[3]]) for row in data]
+    return positions, orientations
 
 
 # =============================================================================
@@ -1275,4 +1366,13 @@ def force_torque_calculator_nlist(bodies, r_vecs, **kwargs):
 
 # =============================================================================
 if __name__ == '__main__':
-    main()
+    main(restart_dir=None, restart_index=None)
+
+    # To restart from a saved configuration instead of a fresh placement,
+    # give the source directory and the config index to load (matching a
+    # config_{index:07d}.txt written by an earlier run's save_configuration
+    # calls) -- ONLY that configuration's positions/orientations are used;
+    # every other parameter above in main() still applies as written here,
+    # not whatever was used to produce restart_dir:
+    # main(restart_dir='mag_anneal_N1000_B0_0.95_..._stoch_False_mutualpol_False',
+    #      restart_index=42)
