@@ -200,7 +200,7 @@ print("  CPU CHOLMOD comparison")
 print("=" * 60)
 
 import scipy.sparse as sp
-from sksparse.cholmod import analyze
+from sksparse.cholmod import CholeskyFactor
 
 # b on CPU for CHOLMOD
 b_single_cpu = b_single.get()
@@ -226,21 +226,25 @@ print(f"\nCHOLMOD symbolic analysis ...")
 t_sym_trials = []
 for _ in range(n_trials):
     t0 = time.perf_counter()
-    sym = analyze(R_cpu)
+    sym = CholeskyFactor(R_cpu)
     t_sym_trials.append((time.perf_counter() - t0) * 1e3)
-sym = analyze(R_cpu)
+sym = CholeskyFactor(R_cpu)
 t_sym = np.array(t_sym_trials)
 print(f"  Symbolic analysis:  {t_sym.mean():.3f} ± {t_sym.std():.3f} ms"
       f"  [{t_sym.min():.3f}, {t_sym.max():.3f}]")
 
 # --- CHOLMOD numeric factorisation ---
+# factorize() mutates `sym` in place (scikit-sparse >=0.5.0), reusing its symbolic
+# analysis each call -- matches the old sym.cholesky(R_cpu) semantics of repeated
+# numeric-only refactorization against the same cached symbolic analysis.
 print(f"\nCHOLMOD numeric factorisation ...")
 t_num_trials = []
 for _ in range(n_trials):
     t0 = time.perf_counter()
-    fac = sym.cholesky(R_cpu)
+    sym.factorize(R_cpu)
     t_num_trials.append((time.perf_counter() - t0) * 1e3)
-fac = sym.cholesky(R_cpu)
+sym.factorize(R_cpu)
+fac = sym
 t_num = np.array(t_num_trials)
 print(f"  Numeric factor:     {t_num.mean():.3f} ± {t_num.std():.3f} ms"
       f"  [{t_num.min():.3f}, {t_num.max():.3f}]")
@@ -251,9 +255,9 @@ t_chol_solve_trials = []
 for trial in range(n_trials):
     b_trial_cpu = b_mat[:, trial].get()
     t0 = time.perf_counter()
-    _ = fac.solve_A(b_trial_cpu)
+    _ = fac.solve(b_trial_cpu)
     t_chol_solve_trials.append((time.perf_counter() - t0) * 1e3)
-x_cholmod = fac.solve_A(b_single_cpu)
+x_cholmod = fac.solve(b_single_cpu)
 t_chol_s = np.array(t_chol_solve_trials)
 print(f"  Solve (1 RHS, {n_trials} trials, varying b):")
 print(f"    {t_chol_s.mean():.3f} ± {t_chol_s.std():.3f} ms"

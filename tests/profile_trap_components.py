@@ -23,7 +23,7 @@ import time
 from functools import partial
 from numba import njit, prange
 from scipy.spatial.transform import Rotation
-from sksparse.cholmod import cholesky
+from sksparse.cholmod import cholesky, cho_factor
 
 from body import Body
 from pyStokesianDynamics import pyStokesianDynamics
@@ -208,12 +208,14 @@ r_vecs = [b.location.copy() for b in bodies]
 # Build preconditioner (same as in Lubrication_solve)
 small           = 6.0 * np.pi * eta * a * solver.tolerance
 Eig_Shift_R_Sup = solver.R_Sup + sp.diags(small * np.ones(n_dof), 0, format='csc')
-factor          = cholesky(Eig_Shift_R_Sup)
+factor          = cho_factor(Eig_Shift_R_Sup)
 
 # Build Delta_R Cholesky for DRhalf
+# cholesky() with no `order=` kwarg returns the unpermuted factor directly
+# (scikit-sparse >=0.5.0), so LL^T = Eig_Shift_DR with no un-permutation needed.
 small_dr        = 1e-5 * 6.0 * np.pi * eta * a
 Eig_Shift_DR    = solver.Delta_R + sp.diags(small_dr * np.ones(n_dof), 0, format='csc')
-factor_dr       = cholesky(Eig_Shift_DR)
+L_dr            = cholesky(Eig_Shift_DR)
 
 # Random test vectors
 X_test = np.random.randn(n_dof)
@@ -246,9 +248,9 @@ print(f"{'='*65}")
 t_mob = time_fn("a) Wall_Mobility_Mult",
                 lambda: solver.Wall_Mobility_Mult(X_test))
 
-# b) DRhalf = factor_dr.apply_Pt(factor_dr.L().dot(W1))
+# b) DRhalf = L_dr.dot(W1)
 t_drhalf = time_fn("b) DRhalf (CHOLMOD L*W)",
-                   lambda: factor_dr.apply_Pt(factor_dr.L().dot(W1)))
+                   lambda: L_dr.dot(W1))
 
 # c) Mhalf = sqrtMdotW via libMobility
 def _mhalf():
@@ -262,7 +264,7 @@ def _pc():
     RHS = solver.R_MB.dot(X_test)
     for k in solver.isolated:
         RHS[6*k:6*k+6] = 0.0
-    Y = factor(RHS)
+    Y = factor.solve(RHS)
     for k in solver.isolated:
         Y[6*k:6*k+6] = X_test[6*k:6*k+6]
     return Y

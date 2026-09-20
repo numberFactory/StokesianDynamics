@@ -11,7 +11,7 @@ dependencies:
   - scipy
   - matplotlib
   - libMobility
-  - scikit-sparse
+  - scikit-sparse>=0.5.0   # code targets the v0.5.0 sksparse.cholmod API (CholeskyFactor / cho_factor)
 
   # GPU — CuPy and nvmath-python (wraps cuDSS for sparse GPU solvers)
   # nvmath-python requires cuda-version pin to pull in the right cudss wheel
