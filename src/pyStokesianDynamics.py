@@ -22,7 +22,8 @@ class pyStokesianDynamics(object):
     '''
 
     def __init__(self, bodies, a, eta, periodic_length,
-                 z_max, debye_length=1e-4, allowChangingBoxSize=False):
+                 z_max, debye_length=1e-4, allowChangingBoxSize=False,
+                 wall_lub=True, particle_lub=True):
         '''
         Constructor. Initialises lubrication and libMobility solver objects.
         '''
@@ -35,6 +36,8 @@ class pyStokesianDynamics(object):
         self.dt              = 1.0
         self.cutoff          = 4.5 # DO NOT CHANGE, FITS ARE HARD-CODED TO THIS VALUE
         self.debye_length    = debye_length
+        self.wall_lub        = wall_lub
+        self.particle_lub    = particle_lub
 
         self.Delta_R  = None
         self.R_MB     = None
@@ -135,7 +138,7 @@ class pyStokesianDynamics(object):
                 self.isolated.append(j)
 
         self.R_MB, self.R_Sup = self.LC.ResistCSC_both(
-            r_vecs, neighbors, self.a, self.eta, self.periodic_length)
+            r_vecs, neighbors, self.a, self.eta, self.periodic_length, self.wall_lub, self.particle_lub)
 
         if self.R_MB.nnz == 0:
             self.R_MB  = sp.diags(self.small_diag, 0, format='csc')
@@ -198,6 +201,7 @@ class pyStokesianDynamics(object):
 
         RHS = np.zeros(6 * num_particles)
         if Xm is not None:
+            assert Xm.size == 6 * num_particles, f'Xm should have size 6*N, currently has shape {Xm.shape}'
             RHS += self.Wall_Mobility_Mult(Xm)
         if X is not None:
             RHS += X.ravel()

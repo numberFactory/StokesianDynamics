@@ -66,7 +66,8 @@ public:
                   nb_array_d periodic_length, bool Sup_if_true);
   std::pair<SpMat, SpMat> ResistCSC_both(nb::list r_vectors, nb::list n_list,
                                           double a, double eta,
-                                          nb_array_d periodic_length);
+                                          nb_array_d periodic_length,
+                                          bool wall_lub, bool particle_lub);
   double debye_cut;
   // Physical cutoff for pair rational fits — fits are only valid to 4.5a.
   static constexpr double PAIR_CUTOFF = 4.5;
@@ -610,7 +611,7 @@ SpMat Lubrication::ResistCSC(nb::list r_vectors, nb::list n_list, double a,
 // =============================================================================
 std::pair<SpMat, SpMat>
 Lubrication::ResistCSC_both(nb::list r_vectors, nb::list n_list, double a,
-                             double eta, nb_array_d periodic_length) {
+                             double eta, nb_array_d periodic_length, bool wall_lub, bool particle_lub) {
   // Pair cutoff hardcoded to PAIR_CUTOFF (4.5a); wall corrections always
   // applied to all particles.
   int num_bodies = (int)r_vectors.size();
@@ -644,49 +645,54 @@ Lubrication::ResistCSC_both(nb::list r_vectors, nb::list n_list, double a,
 
   for (int j = 0; j < num_bodies; j++) {
     const nb_array_d &r_j = r_vecs_cast[j];
-    height = r_j(2) / a;
 
-    // Wall correction always applied to all particles — no cutoff check.
-    // The rational fits decay smoothly to zero in the far field.
-    R_wall_mb  = WallResistMatrixMB(height, mob_factor);
-    R_wall_sup = R_wall_mb + WallDeltaR(height, mob_factor);
-    push_block(trip_sup, R_wall_sup, j*6, j*6);
-    push_block(trip_mb,  R_wall_mb,  j*6, j*6);
+    if(wall_lub){
+      height = r_j(2) / a;
 
-    const nb_array_i &neighbors = n_list_cast[j];
-    int num_neighbors = (int)neighbors.size();
-    if (num_neighbors == 0) continue;
+      // Wall correction always applied to all particles — no cutoff check.
+      // The rational fits decay smoothly to zero in the far field.
+      R_wall_mb  = WallResistMatrixMB(height, mob_factor);
+      R_wall_sup = R_wall_mb + WallDeltaR(height, mob_factor);
+      push_block(trip_sup, R_wall_sup, j*6, j*6);
+      push_block(trip_mb,  R_wall_mb,  j*6, j*6);
+    }
 
-    for (int k_ind = 0; k_ind < num_neighbors; k_ind++) {
-      int k = neighbors(k_ind);
-      const nb_array_d &r_k = r_vecs_cast[k];
-      for (int l = 0; l < 3; ++l) {
-        r_jk[l] = r_j(l) - r_k(l);
-        if (periodic_length(l) > 0) {
-          double Ll = periodic_length(l);
-          r_jk[l] -= (int)(r_jk[l]/Ll + 0.5*(int(r_jk[l]>0)-int(r_jk[l]<0)))*Ll;
-          r_jk[l] /= a;
+    if(particle_lub){
+      const nb_array_i &neighbors = n_list_cast[j];
+      int num_neighbors = (int)neighbors.size();
+      if (num_neighbors == 0) continue;
+
+      for (int k_ind = 0; k_ind < num_neighbors; k_ind++) {
+        int k = neighbors(k_ind);
+        const nb_array_d &r_k = r_vecs_cast[k];
+        for (int l = 0; l < 3; ++l) {
+          r_jk[l] = r_j(l) - r_k(l);
+          if (periodic_length(l) > 0) {
+            double Ll = periodic_length(l);
+            r_jk[l] -= (int)(r_jk[l]/Ll + 0.5*(int(r_jk[l]>0)-int(r_jk[l]<0)))*Ll;
+            r_jk[l] /= a;
+          }
         }
-      }
-      r_norm = r_jk.norm();
-      r_hat  = -r_jk / r_norm;
+        r_norm = r_jk.norm();
+        r_hat  = -r_jk / r_norm;
 
-      if (r_norm < PAIR_CUTOFF) {  // hardcoded — fits valid only to 4.5a
-        R_sup = ResistPairSup(r_norm, mob_factor, r_hat);
-        R_mb  = ResistPairMB (r_norm, mob_factor, r_hat);
+        if (r_norm < PAIR_CUTOFF) {  // hardcoded — fits valid only to 4.5a
+          R_sup = ResistPairSup(r_norm, mob_factor, r_hat);
+          R_mb  = ResistPairMB (r_norm, mob_factor, r_hat);
 
-        const int dof_r[4]={j*6,k*6,j*6,k*6}, dof_c[4]={j*6,k*6,k*6,j*6};
-        const int blk_r[4]={0,6,0,6},          blk_c[4]={0,6,6,0};
-        for (int b=0;b<4;b++)
-          for (int row=0;row<6;row++)
-            for (int col=0;col<6;col++) {
-              double vsup = R_sup(blk_r[b]+row, blk_c[b]+col);
-              double vmb  = R_mb (blk_r[b]+row, blk_c[b]+col);
-              if (std::fabs(vsup) > m_eps)
-                trip_sup.emplace_back(dof_r[b]+row, dof_c[b]+col, vsup);
-              if (std::fabs(vmb)  > m_eps)
-                trip_mb.emplace_back (dof_r[b]+row, dof_c[b]+col, vmb);
-            }
+          const int dof_r[4]={j*6,k*6,j*6,k*6}, dof_c[4]={j*6,k*6,k*6,j*6};
+          const int blk_r[4]={0,6,0,6},          blk_c[4]={0,6,6,0};
+          for (int b=0;b<4;b++)
+            for (int row=0;row<6;row++)
+              for (int col=0;col<6;col++) {
+                double vsup = R_sup(blk_r[b]+row, blk_c[b]+col);
+                double vmb  = R_mb (blk_r[b]+row, blk_c[b]+col);
+                if (std::fabs(vsup) > m_eps)
+                  trip_sup.emplace_back(dof_r[b]+row, dof_c[b]+col, vsup);
+                if (std::fabs(vmb)  > m_eps)
+                  trip_mb.emplace_back (dof_r[b]+row, dof_c[b]+col, vmb);
+              }
+        }
       }
     }
   }
@@ -713,6 +719,6 @@ NB_MODULE(lubrication, m) {
            "Returns a scipy CSC sparse matrix of the lubrication resistance.")
       .def("ResistCSC_both", &Lubrication::ResistCSC_both,
            "r_vectors"_a, "n_list"_a, "a"_a, "eta"_a,
-           "periodic_length"_a,
+           "periodic_length"_a, "wall_lub"_a, "particle_lub"_a,
            "Returns (R_MB, R_Sup) as scipy CSC matrices in a single pair loop.");
 }
