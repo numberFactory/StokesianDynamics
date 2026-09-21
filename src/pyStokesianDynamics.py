@@ -10,7 +10,7 @@ import time
 import sys
 import pyamg
 import scipy.sparse as sp
-from sksparse.cholmod import cholesky
+from sksparse.cholmod import cholesky, cho_factor
 from StokesianDynamics import Lubrication
 from libMobility import NBody, DPStokes
 from numba import jit, njit, prange
@@ -180,10 +180,10 @@ class pyStokesianDynamics(object):
         which return X unchanged.
         '''
         RHS = self.R_MB.dot(X)
-        Y_F = R_fact(RHS)
+        Y_F = R_fact.solve(RHS)
         # for k in self.isolated:
         #     RHS[6*k:6*k+6] = 0.0
-        # Y_F = R_fact(RHS)
+        # Y_F = R_fact.solve(RHS)
         # for k in self.isolated:
         #     Y_F[6*k:6*k+6] = X[6*k:6*k+6]
         return Y_F
@@ -212,7 +212,7 @@ class pyStokesianDynamics(object):
 
         Eig_Shift_R_Sup = self.R_Sup + sp.diags(self.small_diag, 0, format='csc')
         
-        factor = cholesky(Eig_Shift_R_Sup)
+        factor = cho_factor(Eig_Shift_R_Sup)
 
         PC = spla.LinearOperator(
             (6 * num_particles, 6 * num_particles),
@@ -259,8 +259,8 @@ class pyStokesianDynamics(object):
             self.small_diag, 0, format='csc')
 
 
-        factor  = cholesky(Eig_Shift_DR)
-        DRhalf  = factor.apply_Pt(factor.L().dot(W1))
+        L  = cholesky(Eig_Shift_DR)
+        DRhalf  = L.dot(W1)
 
         # M^{1/2} * W via sqrtMdotW — W is generated internally by libMobility
         sqrtM_W_U, sqrtM_W_W = self.solver.sqrtMdotW()

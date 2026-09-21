@@ -57,8 +57,7 @@ for idx, h in enumerate(heights):
     r1     = np.array([0.0, 0.0, h],   dtype=np.float64)
     r2     = np.array([1e6, 0.0, h],   dtype=np.float64)
     n_list = [np.array([], dtype=np.int32), np.array([], dtype=np.int32)]
-    R_wall = lub.ResistCSC([r1, r2], n_list, a, eta,
-                           cutoff, 1e10, periodic_length, True).toarray()
+    R_wall = lub.ResistCSC([r1, r2], n_list, a, eta, periodic_length, True).toarray()
     Xa_corr[idx] = R_wall[2, 2] / f0
     Ya_corr[idx] = R_wall[0, 0] / f0
     Yb_wall[idx] = R_wall[0, 4] / f1

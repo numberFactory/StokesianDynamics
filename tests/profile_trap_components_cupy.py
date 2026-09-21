@@ -258,14 +258,16 @@ report("a) Wall_Mobility_Mult (GPU Mdot)",
 
 # b) DRhalf — CPU CHOLMOD L*W + asarray transfer to GPU
 fac = solver._chol_dr_fac
+def _drhalf_cpu():
+    L_dr = fac.get_factor(kind="LL", lower=True)
+    return (L_dr.dot(W1))[np.argsort(fac.perm)]
 report("b) DRhalf (CPU CHOLMOD + GPU transfer)",
-       *cpu_time(lambda: cp.asarray(
-           fac.apply_Pt(fac.L().dot(W1)))))
+       *cpu_time(lambda: cp.asarray(_drhalf_cpu())))
 
 # b split: CHOLMOD only vs transfer only
 report("  b1) CHOLMOD L*W only (CPU)",
-       *cpu_time(lambda: fac.apply_Pt(fac.L().dot(W1))))
-DRhalf_cpu = fac.apply_Pt(fac.L().dot(W1))
+       *cpu_time(_drhalf_cpu))
+DRhalf_cpu = _drhalf_cpu()
 report("  b2) cp.asarray transfer only",
        *gpu_event_time(lambda: cp.asarray(DRhalf_cpu)))
 
@@ -315,7 +317,7 @@ report("f) FT_calc (CPU numba forces)",
 # =============================================================================
 # Summary
 # =============================================================================
-t_drhalf = cpu_time(lambda: cp.asarray(fac.apply_Pt(fac.L().dot(W1))))[0]
+t_drhalf = cpu_time(lambda: cp.asarray(_drhalf_cpu()))[0]
 t_mhalf  = gpu_event_time(_mhalf)[0]
 t_pc     = gpu_event_time(_pc)[0]
 t_mult   = gpu_event_time(lambda: solver.IpMDR_Mult(X_test))[0]

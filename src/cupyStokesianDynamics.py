@@ -15,7 +15,7 @@ GPU-accelerated Stokesian Dynamics solver using lubrication_cupy.
 import numpy as np
 import scipy.spatial as spatial
 import scipy.sparse as sp
-from sksparse.cholmod import analyze as cholmod_analyze
+from sksparse.cholmod import CholeskyFactor
 import copy
 
 import cupy as cp
