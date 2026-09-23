@@ -36,6 +36,9 @@ class pyStokesianDynamics(object):
         self.cutoff          = 4.5 # DO NOT CHANGE, FITS ARE HARD-CODED TO THIS VALUE
         self.debye_length    = debye_length
 
+        self.num_rejections_wall = 0
+        self.num_rejections_jump = 0
+
         self.Delta_R  = None
         self.R_MB     = None
         self.R_Sup    = None
@@ -255,7 +258,7 @@ class pyStokesianDynamics(object):
             self.small_diag, 0, format='csc')
 
 
-        L  = cholesky(Eig_Shift_DR)
+        L  = cholesky(Eig_Shift_DR, order=None)
         DRhalf  = L.dot(W1)
 
         # M^{1/2} * W via sqrtMdotW — W is generated internally by libMobility
