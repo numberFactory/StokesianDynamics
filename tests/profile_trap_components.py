@@ -215,7 +215,7 @@ factor          = cho_factor(Eig_Shift_R_Sup)
 # (scikit-sparse >=0.5.0), so LL^T = Eig_Shift_DR with no un-permutation needed.
 small_dr        = 1e-5 * 6.0 * np.pi * eta * a
 Eig_Shift_DR    = solver.Delta_R + sp.diags(small_dr * np.ones(n_dof), 0, format='csc')
-L_dr            = cholesky(Eig_Shift_DR)
+L_dr            = cholesky(Eig_Shift_DR, order=None)
 
 # Random test vectors
 X_test = np.random.randn(n_dof)
