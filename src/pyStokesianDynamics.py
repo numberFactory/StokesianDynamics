@@ -258,8 +258,8 @@ class pyStokesianDynamics(object):
             self.small_diag, 0, format='csc')
 
 
-        L  = cholesky(Eig_Shift_DR, order=None)
-        DRhalf  = L.dot(W1)
+        L_dr  = cholesky(Eig_Shift_DR, order=None)
+        DRhalf  = L_dr.dot(W1)
 
         # M^{1/2} * W via sqrtMdotW — W is generated internally by libMobility
         sqrtM_W_U, sqrtM_W_W = self.solver.sqrtMdotW()
