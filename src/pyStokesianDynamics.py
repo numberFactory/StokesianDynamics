@@ -375,6 +375,123 @@ class pyStokesianDynamics(object):
         self._n_steps_timed += 1
         return reject_wall, reject_jump
 
+
+    def Update_Bodies_RFD(self, FT_calc, print_residual=False):
+        '''
+        Euler Maruyama timestep update.
+        stochastic=True  : includes Brownian noise and drift terms.
+        stochastic=False : purely deterministic, force-driven.
+        Returns (reject_wall, reject_jump).
+        '''
+        L = self.periodic_length
+
+        # save initial configuration into _old slots
+        for b in self.bodies:
+            np.copyto(b.location_old, b.location)
+            b.orientation_old = copy.copy(b.orientation)
+
+        # wrapped positions for predictor
+        r_vecs_np = [b.location for b in self.bodies]
+        r_vecs    = self.put_r_vecs_in_periodic_box(r_vecs_np, L)
+
+        # ── FT_calc (predictor) ───────────────────────────────────────────
+        _t0 = time.perf_counter()
+        FT  = FT_calc(self.bodies, r_vecs).flatten()
+        self.timings['ft_calc'] += time.perf_counter() - _t0
+
+        # ── stochastic RHS ────────────────────────────────────────────────
+        _t0 = time.perf_counter()
+        Root_Xm, Root_X = self.Lub_Mobility_Root_RHS()
+        MXm   = self.Wall_Mobility_Mult(Root_Xm)
+        Mhalf = Root_X + MXm
+
+
+        self.timings['Root M stuff'] += time.perf_counter() - _t0
+
+        # ── predictor solve ───────────────────────────────────────────────
+        _t0   = time.perf_counter()
+        vel_EM = self.Lubrication_solve(X=Mhalf, Xm=FT, X0=self.vel_last, print_residual=print_residual)
+        self.timings['solve_EM'] += time.perf_counter() - _t0
+
+
+        # W is a standard normal random vector size 6*N
+        # update body positions using vel = (delta/2)*W 
+        # get r_vecs_plus = [b.location for b in self.bodies]
+        # self.Set_R_Mats(r_vecs_np=r_vecs_plus) (this sets positions for libmobility as well)
+        # calculate MW = self.Wall_Mobility_Mult(W)
+        # U_plus = self.Lubrication_solve(X=MW, Xm=None, X0=self.vel_last, print_residual=print_residual)
+
+        # update body positions using vel = -(delta/2)*W 
+        # get r_vecs_minus = [b.location for b in self.bodies]
+        # self.Set_R_Mats(r_vecs_np=r_vecs_minus) (this sets positions for libmobility as well)
+        # calculate MW = self.Wall_Mobility_Mult(W)
+        # U_minus = self.Lubrication_solve(X=MW, Xm=None, X0=self.vel_last, print_residual=print_residual)
+
+        # Div(M) = (kbt/delta)*(U_plus-U_minus)
+
+        # velEM += Div(M)
+        
+        # set all positions back to 
+
+        # update for RFD velocities
+        for k, b in enumerate(self.bodies):
+            b.location    = b.location_old.copy()
+            b.orientation = copy.copy(b.orientation_old)
+            b.update(vel_p[6*k:6*k+3] * self.dt,
+                     vel_p[6*k+3:6*k+6] * self.dt,
+                     target='current')
+
+        # ── Set_R_Mats at corrector positions ─────────────────────────────
+        r_vecs_np_c = [b.location for b in self.bodies]
+        r_vecs_c    = self.put_r_vecs_in_periodic_box(r_vecs_np_c, L)
+        _t0 = time.perf_counter()
+        self.Set_R_Mats(r_vecs_np=r_vecs_c)
+        self.timings['set_r_mats'] += time.perf_counter() - _t0
+
+        # ── FT_calc (corrector) ───────────────────────────────────────────
+        _t0  = time.perf_counter()
+        FT_C = FT_calc(self.bodies, r_vecs_c).flatten()
+        self.timings['ft_calc'] += time.perf_counter() - _t0
+
+        # ── corrector solve ───────────────────────────────────────────────
+        RHS_X_C = (D_M + Mhalf) if stochastic else None
+        _t0   = time.perf_counter()
+        vel_c = self.Lubrication_solve(X=RHS_X_C, Xm=FT_C, X0=vel_p, print_residual=print_residual)
+        self.vel_last = vel_c
+        self.timings['solve_corr'] += time.perf_counter() - _t0
+
+        # trapezoidal average → write into _new slots
+        vel_trap = 0.5 * (vel_c + vel_p)
+        for k, b in enumerate(self.bodies):
+            b.location_new    = b.location_old.copy()
+            b.orientation_new = copy.copy(b.orientation_old)
+            b.update(vel_trap[6*k:6*k+3] * self.dt,
+                     vel_trap[6*k+3:6*k+6] * self.dt,
+                     target='new')
+
+        reject_wall, reject_jump = self.Check_Update_With_Jump_Trap()
+        self.num_rejections_wall += reject_wall
+        self.num_rejections_jump += reject_jump
+
+        # accept or reject
+        if (reject_wall + reject_jump) == 0:
+            for b in self.bodies:
+                b.update(np.zeros(3), np.zeros(3), target='current')
+                np.copyto(b.location, b.location_new)
+                b.orientation = copy.copy(b.orientation_new)
+        else:
+            for b in self.bodies:
+                np.copyto(b.location, b.location_old)
+                b.orientation = copy.copy(b.orientation_old)
+
+        # ── Set_R_Mats for next step ──────────────────────────────────────
+        _t0 = time.perf_counter()
+        self.Set_R_Mats()
+        self.timings['set_r_mats'] += time.perf_counter() - _t0
+
+        self._n_steps_timed += 1
+        return reject_wall, reject_jump
+
     def print_timings(self):
         '''Print mean per-step timings for Update_Bodies_Trap components.'''
         n = max(self._n_steps_timed, 1)
