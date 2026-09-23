@@ -23,7 +23,7 @@ class pyStokesianDynamics(object):
 
     def __init__(self, bodies, a, eta, periodic_length,
                  z_max, debye_length=1e-4, allowChangingBoxSize=False,
-                 wall_lub=True, particle_lub=True):
+                 wall_lub=True, particle_lub=True, dt=1.0):
         '''
         Constructor. Initialises lubrication and libMobility solver objects.
         '''
@@ -33,7 +33,7 @@ class pyStokesianDynamics(object):
         self.eta             = eta
         self.a               = a
         self.kT              = 0.0041419464
-        self.dt              = 1.0
+        self.dt              = dt
         self.cutoff          = 4.5 # DO NOT CHANGE, FITS ARE HARD-CODED TO THIS VALUE
         self.debye_length    = debye_length
         self.wall_lub        = wall_lub
