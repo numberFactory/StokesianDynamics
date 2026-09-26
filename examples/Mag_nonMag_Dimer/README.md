@@ -1,14 +1,10 @@
-# `bonded_dimer_EM_force.py`
+# `bonded_dimer.py`
 
 Simulates a **bonded dimer**: two spheres held together by a stiff spring,
 an orientation ("torque") spring, and a bond-direction spring, mimicking a
 physically/chemically bonded pair of colloids, with only one particle
 magnetic, in a uniaxial field that flips sign periodically. Derived from
-`ladder_to_ring_EM_force.py`.
-
-> **Bug fix included:** the permanent moment was previously observed to
-> drift relative to the vector connecting the two spheres, despite the
-> orientation spring. Root cause and fix are in §4b below.
+`ladder_to_ring.py`.
 
 **Units** (as elsewhere in this codebase): lengths in µm, energy/torque in
 aJ, forces in aJ/µm (= pN), magnetic field in mT, magnetic moment in aJ/mT.
