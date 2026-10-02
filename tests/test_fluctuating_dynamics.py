@@ -314,9 +314,9 @@ def _wall_force_numba(r, a, g, rep_firm, deb_firm, firm_delta):
         h        = r[i, 2]
         contact  = a * (1.0 - firm_delta)
         if h > contact:
-            f[i, 2] += (rep_firm / deb) * np.exp(-(h - contact) / deb)
+            f[i, 2] += (rep_firm / deb_firm) * np.exp(-(h - contact) / deb_firm)
         else:
-            f[i, 2] += rep_firm / deb
+            f[i, 2] += rep_firm / deb_firm
     return f
 
 
