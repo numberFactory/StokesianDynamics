@@ -309,7 +309,6 @@ def msd_matrix(matrix):
 def _wall_force_numba(r, a, g, rep_firm, deb_firm, firm_delta):
     N   = r.shape[0]
     f   = np.zeros((N, 3))
-    deb = 0.5 * deb_firm
     for i in prange(N):
         f[i, 2] -= g
         h        = r[i, 2]
