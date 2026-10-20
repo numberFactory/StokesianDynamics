@@ -1,6 +1,7 @@
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 #include <cmath>
+#include <functional>
 #include <iostream>
 #include <utility>
 #include <vector>
@@ -419,7 +420,10 @@ Matrix Lubrication::ResistPairSup(double r_norm, double mob_factor[3],
 // ResistPairMB: rational fit (MB scalars). No asymptotic fallback.
 //
 // Coefficient layout: {d_cut, p0..p5, c0..c4}
-// cf[0] is d_cut (lower bound of training range) — used as the clamp.
+// cf[0] is the lower bound of the training range (5e-3). It is not used:
+// epsilon is clamped at debye_cut, so below 5e-3 the fit is extrapolated
+// (vs the exact two-sphere RPY resistance: ~2e-5 relative error at
+// eps = 1e-3, ~3e-4 at 1e-4, ~3e-3 at 1e-5).
 // Sign note: same Y12B convention as Sup — fit stores -Y12B, so negate.
 // =============================================================================
 Matrix Lubrication::ResistPairMB(double r_norm, double mob_factor[3],
@@ -521,6 +525,27 @@ Matrix Lubrication::ResistPairMB(double r_norm, double mob_factor[3],
 }
 
 // =============================================================================
+// Pair separation in units of a: r_jk = (r_j - r_k)/a, using the minimum image
+// in periodic directions (periodic_length(l) > 0). The pair fits and
+// PAIR_CUTOFF are in units of a, so every component is divided by a, periodic
+// or not. (Previously only periodic components were divided, so in open
+// directions r_norm was in physical units, wrong whenever a != 1.)
+// =============================================================================
+static inline Vector3 pair_separation(const nb_array_d &r_j, const nb_array_d &r_k,
+                                      double a, const nb_array_d &periodic_length) {
+  Vector3 r_jk;
+  for (int l = 0; l < 3; ++l) {
+    r_jk[l] = r_j(l) - r_k(l);
+    if (periodic_length(l) > 0) {
+      const double Ll = periodic_length(l);
+      r_jk[l] -= (int)(r_jk[l]/Ll + 0.5*(int(r_jk[l]>0)-int(r_jk[l]<0)))*Ll;
+    }
+    r_jk[l] /= a;
+  }
+  return r_jk;
+}
+
+// =============================================================================
 // ResistCSC: build sparse matrix, return as scipy CSC via nanobind
 // =============================================================================
 SpMat Lubrication::ResistCSC(nb::list r_vectors, nb::list n_list, double a,
@@ -573,14 +598,7 @@ SpMat Lubrication::ResistCSC(nb::list r_vectors, nb::list n_list, double a,
     for (int k_ind = 0; k_ind < num_neighbors; k_ind++) {
       int k = neighbors(k_ind);
       const nb_array_d &r_k = r_vecs_cast[k];
-      for (int l = 0; l < 3; ++l) {
-        r_jk[l] = r_j(l) - r_k(l);
-        if (periodic_length(l) > 0) {
-          double Ll = periodic_length(l);
-          r_jk[l] -= (int)(r_jk[l]/Ll + 0.5*(int(r_jk[l]>0)-int(r_jk[l]<0)))*Ll;
-          r_jk[l] /= a;
-        }
-      }
+      r_jk   = pair_separation(r_j, r_k, a, periodic_length);
       r_norm = r_jk.norm();
       r_hat  = -r_jk / r_norm;
 
@@ -660,14 +678,7 @@ Lubrication::ResistCSC_both(nb::list r_vectors, nb::list n_list, double a,
     for (int k_ind = 0; k_ind < num_neighbors; k_ind++) {
       int k = neighbors(k_ind);
       const nb_array_d &r_k = r_vecs_cast[k];
-      for (int l = 0; l < 3; ++l) {
-        r_jk[l] = r_j(l) - r_k(l);
-        if (periodic_length(l) > 0) {
-          double Ll = periodic_length(l);
-          r_jk[l] -= (int)(r_jk[l]/Ll + 0.5*(int(r_jk[l]>0)-int(r_jk[l]<0)))*Ll;
-          r_jk[l] /= a;
-        }
-      }
+      r_jk   = pair_separation(r_j, r_k, a, periodic_length);
       r_norm = r_jk.norm();
       r_hat  = -r_jk / r_norm;
 
