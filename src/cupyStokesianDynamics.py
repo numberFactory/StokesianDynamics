@@ -15,7 +15,7 @@ GPU-accelerated Stokesian Dynamics solver using lubrication_cupy.
 import numpy as np
 import scipy.spatial as spatial
 import scipy.sparse as sp
-from sksparse.cholmod import CholeskyFactor
+from sksparse.cholmod import analyze as cholmod_analyze
 import copy
 
 import cupy as cp
@@ -87,7 +87,7 @@ class cupyStokesianDynamics:
         self._r_gpu  = None   # (N,3) in units of a, float64
         self._j_gpu  = None   # flat pair source indices, int32
         self._k_gpu  = None   # flat pair dest   indices, int32
-        self._pl_gpu = None   # periodic_length (3,), float64
+        self._pl_gpu = None   # periodic_length (3,) in units of a, float64
 
         self.LC = LubricationCuPy(debye_length, dtype=cp.float64)
 
@@ -147,8 +147,11 @@ class cupyStokesianDynamics:
         L_np        = self.periodic_length_np
 
         r_np    = r_gpu.get()   # single transfer for cKDTree
-        boxsize = L_np if np.all(L_np > 0) else None
-        tree    = spatial.cKDTree(r_np, boxsize=boxsize,
+        # cKDTree treats a boxsize of 0 as non-periodic, so L = [Lx, Ly, 0]
+        # (doubly periodic) is periodic in x and y only, as in the CPU solver.
+        # (Passing None unless all three lengths were > 0 dropped neighbours
+        # across the x/y boundaries of a doubly periodic box.)
+        tree    = spatial.cKDTree(r_np, boxsize=L_np,
                                   balanced_tree=False, compact_nodes=False)
 
         neighbors = []
@@ -168,10 +171,14 @@ class cupyStokesianDynamics:
             j_np = np.empty(0, dtype=np.int32)
             k_np = np.empty(0, dtype=np.int32)
 
+        # Positions AND periodic lengths in units of a: lubrication_cupy takes
+        # the minimum image of r_gpu[j] - r_gpu[k] with pl_gpu, so both must
+        # be in the same units (the pair fits and the 4.5 cutoff are in units
+        # of a). Passing L in physical units broke the minimum image for a != 1.
         self._r_gpu  = (r_gpu / self.a).astype(cp.float64)
         self._j_gpu  = cp.asarray(j_np)
         self._k_gpu  = cp.asarray(k_np)
-        self._pl_gpu = self.periodic_length.astype(cp.float64)
+        self._pl_gpu = (self.periodic_length / self.a).astype(cp.float64)
 
         # libMobility accepts CuPy — no host transfer
         self.solver.setPositions(r_gpu.flatten())
@@ -199,10 +206,14 @@ class cupyStokesianDynamics:
         n_dof = 6 * N
 
         neighbors   = self._build_neighbour_list(r_gpu)
-        r_vecs_list = [r_gpu[j].get() for j in range(N)]   # fast-path fallback
+        r_vecs_list = list(r_gpu.get())   # fast-path fallback (one transfer)
 
+        # periodic_length (in units of a, like pl_gpu) must be passed too:
+        # lubrication_cupy decides which directions are periodic from it, and
+        # with the default (None -> zeros) the minimum image was never applied.
         R_MB_gpu, R_Sup_gpu = self.LC.ResistCSC_both(
             r_vecs_list, neighbors, self.a, self.eta,
+            periodic_length=self.periodic_length_np / self.a,
             r_gpu=self._r_gpu, j_gpu=self._j_gpu,
             k_gpu=self._k_gpu, pl_gpu=self._pl_gpu)
 
@@ -263,6 +274,7 @@ class cupyStokesianDynamics:
         """
         RHS_gpu = self.R_MB @ X_gpu
         Y_gpu = self._chol_pc.solve(RHS_gpu)
+        return Y_gpu
         # for k in self.isolated:
         #     RHS_gpu[6*k:6*k+6] = 0.0
         # Y_gpu = self._chol_pc.solve(RHS_gpu)
@@ -351,11 +363,12 @@ class cupyStokesianDynamics:
     # =========================================================================
     # Timestep
     # =========================================================================
-    def Update_Bodies_Trap(self, FT_calc, stochastic=True):
+    def Update_Bodies_Trap(self, FT_calc, stochastic=True, print_residual=False):
         """
         Predictor-corrector (trapezoidal) timestep.
 
         FT_calc(bodies, r_gpu) → cp.ndarray (6N,) forces/torques on GPU.
+        print_residual: as in the CPU solver (prints GMRES iterations).
         Returns (reject_wall, reject_jump).
         """
         for b in self.bodies:
@@ -378,7 +391,8 @@ class cupyStokesianDynamics:
             D_M_gpu   = None
 
         # predictor
-        vel_p_gpu = self.Lubrication_solve(X_gpu=Mhalf_gpu, Xm_gpu=FT_gpu)
+        vel_p_gpu = self.Lubrication_solve(X_gpu=Mhalf_gpu, Xm_gpu=FT_gpu,
+                                           print_residual=print_residual)
         vel_p_np  = vel_p_gpu.get()
 
         for k, b in enumerate(self.bodies):
@@ -396,7 +410,8 @@ class cupyStokesianDynamics:
         RHS_X_C  = (D_M_gpu + Mhalf_gpu) if stochastic else None
 
         vel_c_gpu = self.Lubrication_solve(
-            X_gpu=RHS_X_C, Xm_gpu=FT_C_gpu, X0_gpu=vel_p_gpu)
+            X_gpu=RHS_X_C, Xm_gpu=FT_C_gpu, X0_gpu=vel_p_gpu,
+            print_residual=print_residual)
         vel_c_np  = vel_c_gpu.get()
 
         vel_trap_np = 0.5 * (vel_c_np + vel_p_np)
