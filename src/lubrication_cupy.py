@@ -459,12 +459,21 @@ class Lubrication:
         pl_g  = pl_gpu.astype(dtyp) if pl_gpu is not None \
                 else cp.asarray(pl_np, dtype=dtyp)
 
+        # Units: pair separations are taken in units of a (the pair fits and
+        # the 4.5 cutoff are in units of a), so positions and periodic lengths
+        # must both be in units of a. r_gpu / pl_gpu are expected in units of
+        # a already (see cupyStokesianDynamics._build_neighbour_list);
+        # r_vectors / periodic_length are physical (C++-compatible call) and
+        # are scaled here. (Previously periodic_length was not scaled, which
+        # broke the minimum image for a != 1.)
         if r_gpu is not None:
             r_g = r_gpu.astype(dtyp) if r_gpu.dtype != dtyp else r_gpu
         else:
             r_g = cp.asarray(
                 np.asarray(r_vectors, dtype=np.float64).reshape(N, 3) / a,
                 dtype=dtyp)
+            if pl_gpu is None:
+                pl_g = cp.asarray(pl_np / a, dtype=dtyp)
 
         rows_mb, cols_mb, vals_mb = [], [], []
         rows_sup, cols_sup, vals_sup = [], [], []
