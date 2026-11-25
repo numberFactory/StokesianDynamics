@@ -49,7 +49,7 @@ for _module in ('sksparse.cholmod', 'cupy', 'cupyx.scipy.sparse',
         pass
 
 from libMobility import NBody, DPStokes
-from lubrication_cupy_fast import LubricationAssembler
+from lubrication_cupy import LubricationAssembler
 
 
 class cupyStokesianDynamics(object):
@@ -558,7 +558,7 @@ class cupyStokesianDynamics(object):
 #    4. GMRES implementations
 #
 #    The lubrication matrices themselves are assembled by
-#    lubrication_cupy_fast.LubricationAssembler (fused CUDA kernels).
+#    lubrication_cupy.LubricationAssembler (fused CUDA kernels).
 #
 # ##############################################################################
 # ##############################################################################
