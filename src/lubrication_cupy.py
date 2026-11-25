@@ -1,554 +1,1047 @@
 """
-lubrication_cupy.py
---------------------
-CuPy-vectorised lubrication resistance matrix assembly.
-All coefficient arrays declared directly as cp.array — no CPU intermediates.
-Drop-in replacement for the C++ nanobind Lubrication class.
+lubrication_cupy_fast.py
+------------------------
+Fused GPU assembly of the lubrication resistance matrices.
+
+What it replaces
+~~~~~~~~~~~~~~~~
+``lubrication_cupy.ResistCSC_both`` launches a few hundred small CuPy kernels
+per call, synchronises with the host at every boolean-mask compaction
+(``mask.any()``, ``a[mask]``), materialises (M,12,12) temporaries, then sorts
+COO triplets into CSC; the solver adds ``R_Sup - R_MB`` and ``R_Sup + diag``
+afterwards with cuSPARSE csrgeam (more allocations, more syncs).
+
+Here the sparsity pattern is the 6x6-block pattern {diagonal blocks} U
+{(i,k), (k,i) : pair (i,k)}.  It is built once per neighbour list, and two
+kernels (one thread per off-diagonal block, one thread per particle) write
+the four matrices the solver needs straight into persistent CSR buffers:
+
+    R_MB              lubrication-free (RPY) near-field resistance
+    R_SupS            R_Sup + diag(small)       -> preconditioner factorisation
+    Delta_R           R_Sup - R_MB              -> GMRES matvec
+    Delta_RS          R_Sup - R_MB + diag(small)-> Brownian square root
+
+No host synchronisation, no sorting and no allocation happen during
+assembly; the CSR matrices are views of the persistent buffers, so they
+refresh in place.
+
+Brownian increments: Delta_R is a sum of positive semi-definite pair blocks
+(12x12) and wall blocks (6x6), so ``brownian()`` draws a vector with
+covariance Delta_R + diag(small) exactly, pair by pair (a 12x12 Cholesky per
+pair and a 6x6 one per particle, in two kernels), without factorising the
+global matrix.  Columns inside each row are sorted and the matrices are
+exactly symmetric, so the same arrays are also valid CSC arrays.
+
+The kernel arithmetic mirrors ``lubrication.cpp`` operation by operation and
+its coefficient tables are generated from that file (the copies in
+``lubrication_cupy.py`` differ from the C++ in two digits: MB Y11B c3 and MB
+Y11C c4).
+
+Public API
+~~~~~~~~~~
+BlockPattern(N, pairs)       host-side block pattern from an upper-triangle pair list
+LubricationAssembler(...)    device buffers + kernels; set_pattern(), assemble(),
+                             brownian()
+Lubrication(d_cut)           drop-in for lubrication_cupy.Lubrication (ResistCSC_both)
+KERNEL_SOURCE                the CUDA source (also compiles as C++ for CPU tests)
 """
 import numpy as np
-import cupy as cp
-import cupyx.scipy.sparse as cpsp
 
 # =============================================================================
-# All coefficients declared directly on GPU
+# CUDA source.  Coefficient tables are generated from lubrication.cpp.
 # =============================================================================
+KERNEL_SOURCE = r"""
+// ---- coefficient tables generated from lubrication.cpp by gen_tables.py ----
+// pair fits, rows = X11A X12A Y11A Y12A Y11B Y12B X11C X12C Y11C Y12C
+// layout {crossover_or_dcut, p0..p5, c0..c4}; P = sum p_i e^i, Q = 1 + sum c_i^2 e^(i+1)
+__constant__ double LUB_CF_SUP[10][12] = {
+  {0.07006673, -19.81052779593092, 2340.828937668049, 496583.4145654573, 1139263.177405481, -31074.90582481417, 6123.7462736942, -546.5471058359071, -1069.447402186549, -6.581289099212643e-09, -9.673175257729874e-10, -0.006988711115145478},
+  {0.024579, -0.01593939244959434, 4.445665389795823, -407.8726991721069, -10343.51092030956, -8219.652436471222, -137017.3545248133, 0.0002488928114444593, -125.8809718612856, 1.407296176369766e-08, -489.2039651123681, 340.798406089767},
+  {0.005228588, 2.171207126379109, 385.3002949507692, 6624.352544471424, 14846.97318890232, 7047.767136709095, 6540.53110009895, -15.11807925068774, 70.12000660040704, -119.3647614569199, -80.41378517885596, -81.22175958097344},
+  {0.005248093, -1.461562640575963, -250.7841615126929, -4331.083375391881, -9737.921752082497, -405.8329204467756, 36.0694371181188, -15.96895122841455, 81.097522696183, -163.8005603371911, 125.4673064262033, 5.431104446475567},
+  {0.005313637, -1.043087981132569, 5195.160018422946, 1121528.966727754, 13552940.10638291, -3532929.933499587, 445881.588056825, 63.31300459521475, -1375.961122074268, -7415.395959620902, -14145.65234165133, -7015.955939280531},
+  {0.005138518, 1.266855888751514, 689.9463247856546, 42162.36929666354, 214793.1207416082, -28760.20054138726, 1086.426843098747, 27.07637792335356, -267.4955385301423, 907.853279270014, 982.5987715332953, -0.5482196655744529},
+  {0.00511307, 1.39787402301662, 13.45883636860944, 24343.01005382227, 144419.8486149228, 100369.733344705, 241094.1641426479, 3.067204057507511, 132.0239652333805, 329.2073502673707, -274.3878779348838, -425.2396254964442},
+  {0.00505, -0.2022446304463027, -59.56596895307574, -480.17122393228, 238.4455230908337, -57.5716349958705, 5.798541137001251, 17.48413100133951, 58.19390284035368, -58.63429968285631, -0.1179113239482045, -4.26868317397772e-09},
+  {0.005307046, 2.802854397382923, 446.2442222692911, 7021.330954933401, 18854.37964587811, 15080.56246869293, -20.94355307813514, 14.81417448480583, 67.3298447745887, -120.6040482897068, -105.7879287786618, -0.002765378408631323},
+  {0.01509115, -0.9141796920496276, 1342.735109731877, 393657.7516657912, 3699261.691007629, -1507356.098885682, 220556.1499489647, 38.669926302272, -1228.093930062573, 5906.456100095043, 7791.981385860539, 18.73855300354582}
+};
+__constant__ double LUB_CF_MB[10][12] = {
+  {0.005, -0.2499999982474416, 1.165664399869339, 2.15479395202148, 1.270149386850713, 0.2483649225013684, -4.186019883001905e-05, -1.37892871564435, 1.15648841672807, 0.4976911470183872, 4.87046577387603e-06, -4.4233929600877e-07},
+  {0.005, 0.2500000295508952, -0.8497183983207306, -0.01951820680989982, 0.2619149841535253, -0.4534273305750967, -0.3145525674635611, 0.838869434145594, 1.603695663575e-06, -0.6246243735852574, 0.9857882804654846, 0.5012686787659838},
+  {0.005, 1.334448916124861, 1.533276418322284, 0.02504280783426653, 0.04777495936484357, 0.3630334324421668, 0.123786614375824, 1.289180844579062, 1.602843358683278e-05, 0.01263923257788066, -0.5997350601777206, 0.3521911887962246},
+  {0.005, -0.616770894921961, -0.2537080095626051, 0.1307822038490171, -0.1204261677530989, -0.12066497180424, -8.620245076540467e-05, -1.298347445853823, -7.248656296164483e-06, -0.0002865726715854026, -0.6865090702813017, 0.4033767918608367},
+  {0.005, 0.1757300002175146, -0.1263482053075663, 0.05466331979155107, 0.004145104715957172, -0.000485568801427177, 2.869576324453811e-05, -1.286512595383362, -0.0001165742481270486, -0.004740203421187537, -0.5567875571587672, -0.3249642869760815},
+  {0.005, 0.3445954579556256, 0.01715184390725956, -0.08224756090070001, 0.0773524340601694, 0.001035089219385419, -6.484151006279233e-05, -1.279854181851254, -0.0001070970483681416, -0.04365905834933606, -0.4632099590221615, 0.2926235258785276},
+  {0.005, 1.354497402277264, 1.685515273189768, 0.03267336413581359, -0.01215634951152663, 0.9006177715282025, 0.9200311837421076, 1.136664193298283, -0.0001011738645854246, 0.0006378569015548268, 0.8207819113317577, 0.830766730039108},
+  {0.005, -0.1693122019768674, 0.0923135264120065, -0.01787657927723367, -0.01648168837655593, 0.002008204276597, -0.0001214848156108869, -1.001192015055246, -1.528540714747427e-07, 0.06544951602958429, 0.3532367548183314, 0.2868536488193641},
+  {0.005, 1.427805390573128, 2.108235342790945, 0.0569868610116822, 0.01538429638251989, 0.4805901339731146, 0.2249137271154556, 1.286277704062037, -1.490352315543504e-05, 0.1373451534868378, 0.5996424201465841, 0.4107768723410937},
+  {0.005, 0.1331703764524452, -0.08242976148134072, 0.02876821851261879, 0.007924040945752319, -0.00099317987508754, 6.253327411129789e-05, 1.272211977886686, -0.0005812561617915775, -0.1858813454068888, -0.4861222841829775, -0.3301018709137714}
+};
+// wall RPY fits, rows = Xa Ya Yb Xc Yc;  u = 1/(1 + h/0.5)
+__constant__ double LUB_RPY_P[5][4] = {
+  {2.249994311366312, -9.302942542409326, 10.18898977062156, -0.1461983146752135},
+  {1.124980798925478, -5.161218663062001, 7.210326948819593, -2.621851150554913},
+  {-2.019389402582813, 7.475392505257506, -3.877269126222068, -1.028617914833345},
+  {1.333114620704834, -4.215726080748013, -0.05775019233806103, 0.1969213190855149},
+  {3.339371808444304, -14.06703500455225, 8.727632354389423, 9.801957547519073}
+};
+__constant__ double LUB_RPY_Q[5][4] = {
+  {-7.384833913349599, 19.74855818648951, -20.40618954066672, 4.353438654549962},
+  {-6.713754414307387, 17.06822775135723, -19.33894500702774, 7.41343677801746},
+  {-8.683501976306239, 28.35163248843032, -42.34435891678831, 25.31363165467517},
+  {-6.164932696556416, 12.47407137449759, -11.35905628832895, 6.141510604219781},
+  {-7.179264725936619, 17.82208382807917, -18.84878181254139, 8.912717591979181}
+};
+__constant__ int LUB_RPY_PMIN[5] = {1, 1, 4, 3, 3};
+__constant__ int LUB_RPY_NP[5]   = {4, 4, 4, 4, 4};
+__constant__ int LUB_RPY_NQ[5]   = {4, 4, 4, 4, 4};
+// wall Delta_R chimera fits (zero padded)
+__constant__ double LUB_DR_P[5][5] = {
+  {0.003390440744007662, -0.1292707770613473, 1.621030547158851, 0.0, 0.0},
+  {-0.001802661869524016, 0.009468660270547602, 0.3218091451875633, -0.9812949264604398, 0.0},
+  {-1.17172041890462, 26.34024743369987, -203.7770517911233, 660.4148051813611, -764.4275364225128},
+  {-0.06769668477673338, 0.4251981921512744, -0.4761218699317399, -0.5662068770688917, 0.0},
+  {0.04774546185054501, -1.200098819024352, 11.43510786982436, -47.54910568257404, 72.29905586544142}
+};
+__constant__ double LUB_DR_Q[5][4] = {
+  {-9.934759618046485, 38.52782844267631, -69.19767486523838, 48.12890822657162},
+  {-10.77793936835893, 45.59152441171614, -90.09502525501624, 69.97760797588727},
+  {-14.58404137489715, 78.17171888830218, -182.0761238925333, 155.4914960487163},
+  {-7.986015731409064, 21.07903159501786, -18.36099133069141, 0.0},
+  {-14.20388909734784, 73.66905048843127, -164.4525346135324, 132.9770561654655}
+};
+__constant__ int LUB_DR_PMIN[5] = {1, 1, 4, 3, 3};
+__constant__ int LUB_DR_NP[5]   = {3, 4, 5, 4, 5};
+__constant__ int LUB_DR_NQ[5]   = {4, 4, 4, 3, 4};
+__constant__ double LUB_DR_ASYM_CUT[5] = {0.20549, 0.029118, 0.1, 0.0097, 0.0456};
+__constant__ double LUB_DR_RPY_CUT[5]  = {7.0, 5.6, 3.4, 0.4, 5.0};
 
-# Scalar constants
-_RPY_HSCALE  = 0.5
-_DR_HSCALE   = 0.5
-# pi^2/6 - 1  and  6*pi (precomputed, no np.pi at runtime)
-_PI2_6_M1    = 6.449340668482264e-01
-_6PI         = 18.84955592153876
+// ============================================================================
+// Fused lubrication assembly kernels.
+//
+// The matrices are assembled directly into a CSR array whose pattern is the
+// 6x6-block pattern {diagonal blocks} U {(i,k),(k,i) : pair (i,k)}.  For block
+// row i with deg_i blocks (diagonal included) starting at block index bptr[i],
+// scalar row 6i+lr starts at 36*bptr[i] + lr*6*deg_i and entry (lr,lc) of the
+// block with block index b sits at
+//         36*bptr[i] + lr*6*deg_i + 6*(b - bptr[i]) + lc .
+// Columns inside a row are therefore sorted, so the CSR is canonical and,
+// because the matrix is symmetric, the very same arrays are also its CSC.
+//
+// Four value arrays are written in one pass:
+//   vMB  = R_MB
+//   vSS  = R_Sup + diag(small)          (preconditioner factorization)
+//   vDR  = R_Sup - R_MB                 (Delta_R, used in the GMRES matvec)
+//   vDRS = R_Sup - R_MB + diag(small)   (Brownian square root)
+//
+// Arithmetic mirrors lubrication.cpp operation by operation (same formulas,
+// same operand order) so CPU and GPU results agree to rounding.
+// ============================================================================
 
-# RPY wall fits: u=1/(1+h/0.5), P(u)=sum p_i*u^(pmin+i), Q(u)=1+sum q_i*u^(i+1)
-_RPY_PMIN = cp.array([1, 1, 4, 3, 3], dtype=cp.int32)
-_RPY_NP   = cp.array([4, 4, 4, 4, 4], dtype=cp.int32)
-_RPY_NQ   = cp.array([4, 4, 4, 4, 4], dtype=cp.int32)
-_RPY_P = cp.array([
-    [ 2.249994311366312e+00,-9.302942542409326e+00, 1.018898977062156e+01,
-     -1.461983146752135e-01],
-    [ 1.124980798925478e+00,-5.161218663062001e+00, 7.210326948819593e+00,
-     -2.621851150554913e+00],
-    [-2.019389402582813e+00, 7.475392505257506e+00,-3.877269126222068e+00,
-     -1.028617914833345e+00],
-    [ 1.333114620704834e+00,-4.215726080748013e+00,-5.775019233806103e-02,
-      1.969213190855149e-01],
-    [ 3.339371808444304e+00,-1.406703500455225e+01, 8.727632354389423e+00,
-      9.801957547519073e+00],
-], dtype=cp.float64)
-_RPY_Q = cp.array([
-    [-7.384833913349599e+00, 1.974855818648951e+01,-2.040618954066672e+01, 4.353438654549962e+00],
-    [-6.713754414307387e+00, 1.706822775135723e+01,-1.933894500702774e+01, 7.413436778017460e+00],
-    [-8.683501976306239e+00, 2.835163248843032e+01,-4.234435891678831e+01, 2.531363165467517e+01],
-    [-6.164932696556416e+00, 1.247407137449759e+01,-1.135905628832895e+01, 6.141510604219781e+00],
-    [-7.179264725936619e+00, 1.782208382807917e+01,-1.884878181254139e+01, 8.912717591979181e+00],
-], dtype=cp.float64)
+#define LUB_PAIR_CUTOFF 4.5
+#define LUB_PI 3.14159265358979323846
 
-# Delta_R fits: u=1/(1+h/0.5)
-# XcPlus: asym_cut=9.7e-3, n_p=4, n_q=3 (row padded to match array shape)
-_DR_ASYM_CUT = cp.array([2.0549e-01, 2.9118e-02, 1.0e-01, 9.7e-03, 4.56e-02], dtype=cp.float64)
-_DR_RPY_CUT  = cp.array([7.0,        5.6,        3.4,     0.4,     5.0     ], dtype=cp.float64)
-_DR_PMIN     = cp.array([1, 1, 4, 3, 3], dtype=cp.int32)
-_DR_NP       = cp.array([3, 4, 5, 4, 5], dtype=cp.int32)
-_DR_NQ       = cp.array([4, 4, 4, 3, 4], dtype=cp.int32)
-_DR_P = cp.array([
-    [ 3.390440744007662e-03,-1.292707770613473e-01, 1.621030547158851e+00,
-      0.0, 0.0],
-    [-1.802661869524016e-03, 9.468660270547602e-03, 3.218091451875633e-01,
-     -9.812949264604398e-01, 0.0],
-    [-1.171720418904620e+00, 2.634024743369987e+01,-2.037770517911233e+02,
-      6.604148051813611e+02,-7.644275364225128e+02],
-    [-6.769668477673338e-02, 4.251981921512744e-01,-4.761218699317399e-01,
-     -5.662068770688917e-01, 0.0],
-    [ 4.774546185054501e-02,-1.200098819024352e+00, 1.143510786982436e+01,
-     -4.754910568257404e+01, 7.229905586544142e+01],
-], dtype=cp.float64)
-_DR_Q = cp.array([
-    [-9.934759618046485e+00, 3.852782844267631e+01,-6.919767486523838e+01, 4.812890822657162e+01],
-    [-1.077793936835893e+01, 4.559152441171614e+01,-9.009502525501624e+01, 6.997760797588727e+01],
-    [-1.458404137489715e+01, 7.817171888830218e+01,-1.820761238925333e+02, 1.554914960487163e+02],
-    [-7.986015731409064e+00, 2.107903159501786e+01,-1.836099133069141e+01, 0.0],
-    [-1.420388909734784e+01, 7.366905048843127e+01,-1.644525346135324e+02, 1.329770561654655e+02],
-], dtype=cp.float64)
+// ---------------------------------------------------------------------------
+// Pair fits.  SUP selects the table and the asymptotic (AT) fallback.
+// ---------------------------------------------------------------------------
+template <bool SUP>
+__device__ __forceinline__ const double* lub_cf(int s) {
+  return SUP ? LUB_CF_SUP[s] : LUB_CF_MB[s];
+}
 
-# Pair Sup fit coefficients [crossover, p0..p5, c0..c4], Q uses c_i^2
-_CF_SUP = cp.array([
-    [7.006673e-02,-1.981052779593092e+01, 2.340828937668049e+03, 4.965834145654573e+05,
-      1.139263177405481e+06,-3.107490582481417e+04, 6.123746273694200e+03,
-     -5.465471058359071e+02,-1.069447402186549e+03,-6.581289099212643e-09,
-     -9.673175257729874e-10,-6.988711115145478e-03],
-    [2.457900e-02,-1.593939244959434e-02, 4.445665389795823e+00,-4.078726991721069e+02,
-     -1.034351092030956e+04,-8.219652436471222e+03,-1.370173545248133e+05,
-      2.488928114444593e-04,-1.258809718612856e+02, 1.407296176369766e-08,
-     -4.892039651123681e+02, 3.407984060897670e+02],
-    [5.228588e-03, 2.171207126379109e+00, 3.853002949507692e+02, 6.624352544471424e+03,
-      1.484697318890232e+04, 7.047767136709095e+03, 6.540531100098950e+03,
-     -1.511807925068774e+01, 7.012000660040704e+01,-1.193647614569199e+02,
-     -8.041378517885596e+01,-8.122175958097344e+01],
-    [5.248093e-03,-1.461562640575963e+00,-2.507841615126929e+02,-4.331083375391881e+03,
-     -9.737921752082497e+03,-4.058329204467756e+02, 3.606943711811880e+01,
-     -1.596895122841455e+01, 8.109752269618301e+01,-1.638005603371911e+02,
-      1.254673064262033e+02, 5.431104446475567e+00],
-    [5.313637e-03,-1.043087981132569e+00, 5.195160018422946e+03, 1.121528966727754e+06,
-      1.355294010638291e+07,-3.532929933499587e+06, 4.458815880568250e+05,
-      6.331300459521475e+01,-1.375961122074268e+03,-7.415395959620902e+03,
-     -1.414565234165133e+04,-7.015955939280531e+03],
-    [5.138518e-03, 1.266855888751514e+00, 6.899463247856546e+02, 4.216236929666354e+04,
-      2.147931207416082e+05,-2.876020054138726e+04, 1.086426843098747e+03,
-      2.707637792335356e+01,-2.674955385301423e+02, 9.078532792700140e+02,
-      9.825987715332953e+02,-5.482196655744529e-01],
-    [5.113070e-03, 1.397874023016620e+00, 1.345883636860944e+01, 2.434301005382227e+04,
-      1.444198486149228e+05, 1.003697333447050e+05, 2.410941641426479e+05,
-      3.067204057507511e+00, 1.320239652333805e+02, 3.292073502673707e+02,
-     -2.743878779348838e+02,-4.252396254964442e+02],
-    [5.050000e-03,-2.022446304463027e-01,-5.956596895307574e+01,-4.801712239322800e+02,
-      2.384455230908337e+02,-5.757163499587050e+01, 5.798541137001251e+00,
-      1.748413100133951e+01, 5.819390284035368e+01,-5.863429968285631e+01,
-     -1.179113239482045e-01,-4.268683173977720e-09],
-    [5.307046e-03, 2.802854397382923e+00, 4.462442222692911e+02, 7.021330954933401e+03,
-      1.885437964587811e+04, 1.508056246869293e+04,-2.094355307813514e+01,
-      1.481417448480583e+01, 6.732984477458869e+01,-1.206040482897068e+02,
-     -1.057879287786618e+02,-2.765378408631323e-03],
-    [1.509115e-02,-9.141796920496276e-01, 1.342735109731877e+03, 3.936577516657912e+05,
-      3.699261691007629e+06,-1.507356098885682e+06, 2.205561499489647e+05,
-      3.866992630227200e+01,-1.228093930062573e+03, 5.906456100095043e+03,
-      7.791981385860539e+03, 1.873855300354582e+01],
-], dtype=cp.float64)
+__device__ __forceinline__ double lub_eval_PQ(const double* cf, double e) {
+  const double e2 = e*e, e3 = e2*e, e4 = e3*e, e5 = e4*e;
+  const double P = cf[1] + cf[2]*e + cf[3]*e2 + cf[4]*e3 + cf[5]*e4 + cf[6]*e5;
+  const double Q = 1.0 + cf[7]*cf[7]*e + cf[8]*cf[8]*e2 + cf[9]*cf[9]*e3
+                 + cf[10]*cf[10]*e4 + cf[11]*cf[11]*e5;
+  return P / Q;
+}
 
-# Pair MB fit coefficients
-_CF_MB = cp.array([
-    [5e-3,-2.499999982474416e-01, 1.165664399869339e+00, 2.154793952021480e+00,
-      1.270149386850713e+00, 2.483649225013684e-01,-4.186019883001905e-05,
-     -1.378928715644350e+00, 1.156488416728070e+00, 4.976911470183872e-01,
-      4.870465773876030e-06,-4.423392960087700e-07],
-    [5e-3, 2.500000295508952e-01,-8.497183983207306e-01,-1.951820680989982e-02,
-      2.619149841535253e-01,-4.534273305750967e-01,-3.145525674635611e-01,
-      8.388694341455940e-01, 1.603695663575000e-06,-6.246243735852574e-01,
-      9.857882804654846e-01, 5.012686787659838e-01],
-    [5e-3, 1.334448916124861e+00, 1.533276418322284e+00, 2.504280783426653e-02,
-      4.777495936484357e-02, 3.630334324421668e-01, 1.237866143758240e-01,
-      1.289180844579062e+00, 1.602843358683278e-05, 1.263923257788066e-02,
-     -5.997350601777206e-01, 3.521911887962246e-01],
-    [5e-3,-6.167708949219610e-01,-2.537080095626051e-01, 1.307822038490171e-01,
-     -1.204261677530989e-01,-1.206649718042400e-01,-8.620245076540467e-05,
-     -1.298347445853823e+00,-7.248656296164483e-06,-2.865726715854026e-04,
-     -6.865090702813017e-01, 4.033767918608367e-01],
-    [5e-3, 1.757300002175146e-01,-1.263482053075663e-01, 5.466331979155107e-02,
-      4.145104715957172e-03,-4.855688014271770e-04, 2.869576324453811e-05,
-     -1.286512595383362e+00,-1.165742481270486e-04,-4.740203421187537e-03,
-     -5.567875571587572e-01,-3.249642869760815e-01],
-    [5e-3, 3.445954579556256e-01, 1.715184390725956e-02,-8.224756090070001e-02,
-      7.735243406016939e-02, 1.035089219385419e-03,-6.484151006279233e-05,
-     -1.279854181851254e+00,-1.070970483681416e-04,-4.365905834933606e-02,
-     -4.632099590221615e-01, 2.926235258785276e-01],
-    [5e-3, 1.354497402277264e+00, 1.685515273189768e+00, 3.267336413581359e-02,
-     -1.215634951152663e-02, 9.006177715282025e-01, 9.200311837421076e-01,
-      1.136664193298283e+00,-1.011738645854246e-04, 6.378569015548268e-04,
-      8.207819113317577e-01, 8.307667300391079e-01],
-    [5e-3,-1.693122019768674e-01, 9.231352641200651e-02,-1.787657927723367e-02,
-     -1.648168837655593e-02, 2.008204276597000e-03,-1.214848156108869e-04,
-     -1.001192015055246e+00,-1.528540714747427e-07, 6.544951602958429e-02,
-      3.532367548183314e-01, 2.868536488193641e-01],
-    [5e-3, 1.427805390573128e+00, 2.108235342790945e+00, 5.698686101168220e-02,
-      1.538429638251989e-02, 4.805901339731146e-01, 2.249137271154556e-01,
-      1.286277704062037e+00,-1.490352315543504e-05, 1.373451534868378e-01,
-      5.996424201465841e-01, 4.107768773410937e-01],
-    [5e-3, 1.331703764524452e-01,-8.242976148134072e-02, 2.876821851261879e-02,
-      7.924040945752319e-03,-9.931798750875400e-04, 6.253327411129789e-05,
-      1.272211977886686e+00,-5.812561617915775e-04,-1.858813454068888e-01,
-     -4.861222841829775e-01,-3.301018709137714e-01],
-], dtype=cp.float64)
+// Scalars needed for the self (11) blocks: X11A, Y11A, Y11B, X11C, Y11C.
+template <bool SUP>
+__device__ __forceinline__ void lub_scalars_self(double eps, double* s) {
+  const double li = log(1.0 / eps);
+  const double* c;
+  c = lub_cf<SUP>(0);   // X11A (singular)
+  s[0] = (SUP && eps < c[0]) ? (0.995419 + 0.25/eps + 0.225*li + 0.0267857*eps*li)
+                             : (0.25/eps + lub_eval_PQ(c, eps) / eps);
+  c = lub_cf<SUP>(2);   // Y11A
+  s[1] = (SUP && eps < c[0]) ? (0.998317 + 0.166667*li) : lub_eval_PQ(c, eps);
+  c = lub_cf<SUP>(4);   // Y11B
+  s[2] = (SUP && eps < c[0]) ? (-0.666667*(0.23892 - 0.25*li - 0.125*eps*li))
+                             : lub_eval_PQ(c, eps);
+  c = lub_cf<SUP>(6);   // X11C
+  s[3] = (SUP && eps < c[0]) ? (1.33333*(1.0518 - 0.125*eps*li)) : lub_eval_PQ(c, eps);
+  c = lub_cf<SUP>(8);   // Y11C
+  s[4] = (SUP && eps < c[0]) ? (1.33333*(0.702834 + 0.2*li + 0.188*eps*li))
+                             : lub_eval_PQ(c, eps);
+}
+
+// Scalars needed for the coupling (12) blocks: X12A, Y12A, Y12B, X12C, Y12C.
+// The Y12B fit stores -Y12B, so it is negated (both branches, as in the C++).
+template <bool SUP>
+__device__ __forceinline__ void lub_scalars_pair(double eps, double* s) {
+  const double li = log(1.0 / eps);
+  const double* c;
+  c = lub_cf<SUP>(1);   // X12A (singular)
+  s[0] = (SUP && eps < c[0]) ? (-0.350153 - 0.25/eps - 0.225*li - 0.0267857*eps*li)
+                             : (-0.25/eps + lub_eval_PQ(c, eps) / eps);
+  c = lub_cf<SUP>(3);   // Y12A
+  s[1] = (SUP && eps < c[0]) ? (-0.273652 - 0.166667*li) : lub_eval_PQ(c, eps);
+  c = lub_cf<SUP>(5);   // Y12B
+  s[2] = -((SUP && eps < c[0]) ? (0.666667*(-0.00162268 + 0.25*li + 0.125*eps*li))
+                               : lub_eval_PQ(c, eps));
+  c = lub_cf<SUP>(7);   // X12C
+  s[3] = (SUP && eps < c[0]) ? (1.33333*(-0.150257 + 0.125*eps*li)) : lub_eval_PQ(c, eps);
+  c = lub_cf<SUP>(9);   // Y12C
+  s[4] = (SUP && eps < c[0]) ? (1.33333*(-0.027464 + 0.05*li + 0.062*eps*li))
+                             : lub_eval_PQ(c, eps);
+}
+
+// ---------------------------------------------------------------------------
+// Wall fits (u = 1/(1 + h/0.5)).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ double lub_wall_rat(double h, int p_min, int n_p, int n_q,
+                                               const double* p, const double* q) {
+  const double u = 1.0 / (1.0 + h / 0.5);
+  double P = 0.0, upow = pow(u, (double)p_min);
+  for (int i = 0; i < n_p; ++i) { P += p[i] * upow; upow *= u; }
+  double Q = 1.0; upow = u;
+  for (int i = 0; i < n_q; ++i) { Q += q[i] * upow; upow *= u; }
+  return P / Q;
+}
+
+__device__ __forceinline__ double lub_wall_asym(int s, double eps) {
+  const double le = log(eps);
+  switch (s) {
+    case 0:  return 1.0/eps - (1.0/5.0)*le + 0.971280 - 1.0;
+    case 1:  return -(8.0/15.0)*le + 0.9588 - 1.0;
+    case 2:  return (4.0/3.0)*((1.0/10.0)*le + 0.1895 - 0.029 - (0.4576-0.2)*eps);
+    case 3:  return (4.0/3.0)*(1.20206 - 3.0*(LUB_PI*LUB_PI/6.0-1.0)*eps) - 4.0/3.0;
+    default: return (4.0/3.0)*(-(2.0/5.0)*le + 0.3817 + 1.4578*eps) - 4.0/3.0;
+  }
+}
+
+// rpy[s] = RPY wall scalar, dr[s] = Delta_R wall scalar (s = Xa Ya Yb Xc Yc).
+__device__ __forceinline__ void lub_wall_scalars(double height, double debye_cut,
+                                                 double* rpy, double* dr) {
+  double eps = height - 1.0, h = height;
+  if (eps < debye_cut) { eps = debye_cut; h = 1.0 + eps; }
+  for (int s = 0; s < 5; ++s)
+    rpy[s] = lub_wall_rat(h, LUB_RPY_PMIN[s], LUB_RPY_NP[s], LUB_RPY_NQ[s],
+                          LUB_RPY_P[s], LUB_RPY_Q[s]);
+  for (int s = 0; s < 5; ++s) {
+    if (eps > LUB_DR_RPY_CUT[s])        dr[s] = 0.0;
+    else if (eps < LUB_DR_ASYM_CUT[s])  dr[s] = lub_wall_asym(s, eps) - rpy[s];
+    else dr[s] = lub_wall_rat(h, LUB_DR_PMIN[s], LUB_DR_NP[s], LUB_DR_NQ[s],
+                              LUB_DR_P[s], LUB_DR_Q[s]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Geometry helpers
+// ---------------------------------------------------------------------------
+// d = (r_k - r_i)/a with the minimum image in periodic directions (L > 0).
+// Same operations as pair_separation() in lubrication.cpp (round half away
+// from zero, correction applied before dividing by a).
+__device__ __forceinline__ void lub_separation(const double* __restrict__ pos, int i, int k,
+                                               double a, double Lx, double Ly, double Lz,
+                                               double* d) {
+  const double L[3] = {Lx, Ly, Lz};
+  for (int l = 0; l < 3; ++l) {
+    double x = pos[3*k + l] - pos[3*i + l];
+    if (L[l] > 0.0) x -= round(x / L[l]) * L[l];
+    d[l] = x / a;
+  }
+}
+
+// [v x] (cross-product matrix) entry (p, q).
+__device__ __forceinline__ double lub_cross(const double* v, int p, int q) {
+  // [[0,-v2,v1],[v2,0,-v0],[-v1,v0,0]]
+  if (p == q) return 0.0;
+  if (p == 0) return (q == 1) ? -v[2] :  v[1];
+  if (p == 1) return (q == 0) ?  v[2] : -v[0];
+  return (q == 0) ? -v[1] : v[0];
+}
+
+// index of (p,q) in the packed symmetric 3x3 storage {xx,yy,zz,xy,xz,yz}
+__device__ __forceinline__ int lub_sym(int p, int q) {
+  if (p == q) return p;
+  const int s = p + q;           // (0,1)->1, (0,2)->2, (1,2)->3
+  return (s == 1) ? 3 : ((s == 2) ? 4 : 5);
+}
+
+// f*(X*sq + Y*sh) for the packed entry (p,q), sq = r r^T, sh = I - sq
+__device__ __forceinline__ double lub_xy(double f, double X, double Y, const double* r,
+                                         int p, int q) {
+  const double sq = r[p]*r[q];
+  const double sh = (p == q ? 1.0 : 0.0) - sq;
+  return f*(X*sq + Y*sh);
+}
+
+__device__ __forceinline__ void lub_write(long long base, long long rstride, int lr, int lc,
+                                          double vm, double vs, double shift,
+                                          double* __restrict__ vMB, double* __restrict__ vSS,
+                                          double* __restrict__ vDR, double* __restrict__ vDRS) {
+  const long long p = base + lr*rstride + lc;
+  const double dr = vs - vm;
+  vMB[p]  = vm;
+  vSS[p]  = vs + shift;
+  vDR[p]  = dr;
+  vDRS[p] = dr + shift;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 1: off-diagonal blocks, one thread per block (diagonal blocks return).
+//   block (i,k) = [[A12, [c x]], [[c x], C12]]  with r_hat pointing from i to k,
+//   A12 = f0 (X12A sq + Y12A sh), c = f1 Y12B r_hat, C12 = f2 (X12C sq + Y12C sh).
+// The same formula with r_hat -> -r_hat gives block (k,i) = block(i,k)^T, so
+// both halves are produced bitwise symmetric.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void lub_offdiag(
+    const int nb, const double* __restrict__ pos,
+    const int* __restrict__ brow, const int* __restrict__ bcol, const int* __restrict__ bptr,
+    const double a, const double Lx, const double Ly, const double Lz,
+    const double debye_cut, const double f0, const double f1, const double f2,
+    double* __restrict__ vMB, double* __restrict__ vSS,
+    double* __restrict__ vDR, double* __restrict__ vDRS)
+{
+  const int b = blockDim.x * blockIdx.x + threadIdx.x;
+  if (b >= nb) return;
+  const int i = brow[b], k = bcol[b];
+  if (i == k) return;
+  const int start = bptr[i];
+  const long long rstride = 6LL * (bptr[i+1] - start);
+  const long long base = 36LL * start + 6LL * (b - start);
+
+  double d[3];
+  lub_separation(pos, i, k, a, Lx, Ly, Lz, d);
+  const double r = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+  if (!(r < LUB_PAIR_CUTOFF)) {       // buffered pattern: pair outside the fit range
+    for (int lr = 0; lr < 6; ++lr)
+      for (int lc = 0; lc < 6; ++lc)
+        lub_write(base, rstride, lr, lc, 0.0, 0.0, 0.0, vMB, vSS, vDR, vDRS);
+    return;
+  }
+  const double rh[3] = {d[0]/r, d[1]/r, d[2]/r};
+  const double eps = fmax(r - 2.0, debye_cut);
+  double m[5], s[5];
+  lub_scalars_pair<false>(eps, m);
+  lub_scalars_pair<true>(eps, s);
+  // c = f1*(Y12B*r_hat) (operand order of R.block(0,9) = f1*(Y12B*vortMat))
+  const double cm[3] = {f1*(m[2]*rh[0]), f1*(m[2]*rh[1]), f1*(m[2]*rh[2])};
+  const double cs[3] = {f1*(s[2]*rh[0]), f1*(s[2]*rh[1]), f1*(s[2]*rh[2])};
+#pragma unroll
+  for (int lr = 0; lr < 6; ++lr) {
+#pragma unroll
+    for (int lc = 0; lc < 6; ++lc) {
+      double vm, vs;
+      if (lr < 3 && lc < 3) {
+        vm = lub_xy(f0, m[0], m[1], rh, lr, lc);
+        vs = lub_xy(f0, s[0], s[1], rh, lr, lc);
+      } else if (lr < 3) {
+        vm = lub_cross(cm, lr, lc - 3);
+        vs = lub_cross(cs, lr, lc - 3);
+      } else if (lc < 3) {
+        vm = lub_cross(cm, lr - 3, lc);
+        vs = lub_cross(cs, lr - 3, lc);
+      } else {
+        vm = lub_xy(f2, m[3], m[4], rh, lr - 3, lc - 3);
+        vs = lub_xy(f2, s[3], s[4], rh, lr - 3, lc - 3);
+      }
+      lub_write(base, rstride, lr, lc, vm, vs, 0.0, vMB, vSS, vDR, vDRS);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 2: diagonal blocks, one thread per particle.  Wall term + the self
+// (11) part of every pair in the particle's block row:
+//   [[A, [b x]], [[b x]^T, C]],  b_wall = (0,0,-f1 Yb),  b_pair = -f1 Y11B r_hat.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void lub_diag(
+    const int N, const double* __restrict__ pos,
+    const int* __restrict__ bcol, const int* __restrict__ bptr, const int* __restrict__ bdiag,
+    const double a, const double Lx, const double Ly, const double Lz,
+    const double debye_cut, const double f0, const double f1, const double f2,
+    const double sF, const double sT,
+    double* __restrict__ vMB, double* __restrict__ vSS,
+    double* __restrict__ vDR, double* __restrict__ vDRS)
+{
+  const int i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i >= N) return;
+  const int start = bptr[i], end = bptr[i+1];
+  const long long rstride = 6LL * (end - start);
+  const long long base = 36LL * start + 6LL * (bdiag[i] - start);
+
+  // ---- wall part (WallResistMatrixMB and WallResistMatrixMB + WallDeltaR) ----
+  double rpy[5], dw[5];
+  lub_wall_scalars(pos[3*i + 2] / a, debye_cut, rpy, dw);
+  // packed {xx,yy,zz,xy,xz,yz}; Xa=0 Ya=1 Yb=2 Xc=3 Yc=4
+  double mA[6] = {f0*rpy[1], f0*rpy[1], f0*rpy[0], 0.0, 0.0, 0.0};
+  double mC[6] = {f2*rpy[4], f2*rpy[4], f2*rpy[3], 0.0, 0.0, 0.0};
+  double mb[3] = {0.0, 0.0, -(f1*rpy[2])};
+  double sA[6] = {f0*rpy[1] + f0*dw[1], f0*rpy[1] + f0*dw[1], f0*rpy[0] + f0*dw[0], 0.0, 0.0, 0.0};
+  double sC[6] = {f2*rpy[4] + f2*dw[4], f2*rpy[4] + f2*dw[4], f2*rpy[3] + f2*dw[3], 0.0, 0.0, 0.0};
+  double sb[3] = {0.0, 0.0, -(f1*rpy[2] + f1*dw[2])};
+
+  // ---- pair self terms ----
+  for (int bb = start; bb < end; ++bb) {
+    const int k = bcol[bb];
+    if (k == i) continue;
+    double d[3];
+    lub_separation(pos, i, k, a, Lx, Ly, Lz, d);
+    const double r = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+    if (!(r < LUB_PAIR_CUTOFF)) continue;
+    const double rh[3] = {d[0]/r, d[1]/r, d[2]/r};
+    const double eps = fmax(r - 2.0, debye_cut);
+    double m[5], s[5];
+    lub_scalars_self<false>(eps, m);
+    lub_scalars_self<true>(eps, s);
+#pragma unroll
+    for (int p = 0; p < 3; ++p) {
+#pragma unroll
+      for (int q = p; q < 3; ++q) {
+        const int t = lub_sym(p, q);
+        mA[t] += lub_xy(f0, m[0], m[1], rh, p, q);
+        sA[t] += lub_xy(f0, s[0], s[1], rh, p, q);
+        mC[t] += lub_xy(f2, m[3], m[4], rh, p, q);
+        sC[t] += lub_xy(f2, s[3], s[4], rh, p, q);
+      }
+      // B11 = -f1*(Y11B*vortMat)  ->  b = -f1*(Y11B*r_hat)
+      mb[p] += -f1*(m[2]*rh[p]);
+      sb[p] += -f1*(s[2]*rh[p]);
+    }
+  }
+
+#pragma unroll
+  for (int lr = 0; lr < 6; ++lr) {
+#pragma unroll
+    for (int lc = 0; lc < 6; ++lc) {
+      double vm, vs;
+      if (lr < 3 && lc < 3) {
+        vm = mA[lub_sym(lr, lc)];          vs = sA[lub_sym(lr, lc)];
+      } else if (lr < 3) {
+        vm = lub_cross(mb, lr, lc - 3);    vs = lub_cross(sb, lr, lc - 3);
+      } else if (lc < 3) {                 // lower-left = transpose of upper-right
+        vm = lub_cross(mb, lc, lr - 3);    vs = lub_cross(sb, lc, lr - 3);
+      } else {
+        vm = mC[lub_sym(lr-3, lc-3)];      vs = sC[lub_sym(lr-3, lc-3)];
+      }
+      const double shift = (lr == lc) ? (lr < 3 ? sF : sT) : 0.0;
+      lub_write(base, rstride, lr, lc, vm, vs, shift, vMB, vSS, vDR, vDRS);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pattern kernels (run only when the block pattern changes).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void lub_csr_indices(
+    const int nb, const int* __restrict__ brow, const int* __restrict__ bcol,
+    const int* __restrict__ bptr, int* __restrict__ indices)
+{
+  const int b = blockDim.x * blockIdx.x + threadIdx.x;
+  if (b >= nb) return;
+  const int i = brow[b];
+  const int start = bptr[i];
+  const long long rstride = 6LL * (bptr[i+1] - start);
+  const long long base = 36LL * start + 6LL * (b - start);
+  const int c0 = 6 * bcol[b];
+  for (int lr = 0; lr < 6; ++lr)
+    for (int lc = 0; lc < 6; ++lc)
+      indices[base + lr*rstride + lc] = c0 + lc;
+}
+
+extern "C" __global__ void lub_csr_indptr(
+    const int N, const int* __restrict__ bptr, int* __restrict__ indptr)
+{
+  const int row = blockDim.x * blockIdx.x + threadIdx.x;
+  if (row > 6*N) return;
+  if (row == 6*N) { indptr[row] = 36 * bptr[N]; return; }
+  const int i = row / 6, lr = row - 6*i;
+  indptr[row] = 36 * bptr[i] + lr * 6 * (bptr[i+1] - bptr[i]);
+}
+
+// ---------------------------------------------------------------------------
+// Brownian increments with covariance Delta_R + diag(shift), pair by pair.
+//
+// Delta_R is a sum of pair blocks (12x12, on the dofs of particles i < k) and
+// wall blocks (6x6, one per particle), each positive semi-definite.  With
+// P_p = B_p B_p^T and W_i + shift = C_i C_i^T (Cholesky),
+//     y = sum_p E_p B_p xi_p + sum_i E_i C_i eta_i,    xi, eta ~ N(0, I),
+// has covariance sum_p E_p P_p E_p^T + sum_i E_i (W_i + shift) E_i^T
+// = Delta_R + diag(shift) exactly, with no global factorisation.
+//
+// lub_noise_pairs : one thread per pair, ypair[12p + r] = (B_p xi_p)_r
+// lub_noise_gather: one thread per particle, out[6i + r] = (C_i eta_i)_r plus
+//                   the particle's halves of its pairs' ypair, summed in block
+//                   order (deterministic, no atomics)
+// The Cholesky factorisations are "semi-definite": a pivot <= tol*max|diag|
+// drops its column; a pivot < -tol*max|diag| (block not PSD) also sets flag.
+// ---------------------------------------------------------------------------
+template <int n>
+__device__ __forceinline__ int lub_chol_psd(double* Lp) {
+  // Lp: packed lower triangle, entry (r, c) at r*(r+1)/2 + c; in-place factor
+  double scale = 0.0;
+  for (int r = 0; r < n; ++r) scale = fmax(scale, fabs(Lp[r*(r+1)/2 + r]));
+  const double tol = 1e-13 * scale;
+  int flag = 0;
+  for (int j = 0; j < n; ++j) {
+    double d = Lp[j*(j+1)/2 + j];
+    for (int t = 0; t < j; ++t) d -= Lp[j*(j+1)/2 + t] * Lp[j*(j+1)/2 + t];
+    if (d > tol) {
+      const double ljj = sqrt(d);
+      Lp[j*(j+1)/2 + j] = ljj;
+      for (int r = j + 1; r < n; ++r) {
+        double v = Lp[r*(r+1)/2 + j];
+        for (int t = 0; t < j; ++t) v -= Lp[r*(r+1)/2 + t] * Lp[j*(j+1)/2 + t];
+        Lp[r*(r+1)/2 + j] = v / ljj;
+      }
+    } else {
+      if (d < -tol) flag = 1;
+      for (int r = j; r < n; ++r) Lp[r*(r+1)/2 + j] = 0.0;
+    }
+  }
+  return flag;
+}
+
+extern "C" __global__ void lub_noise_pairs(
+    const int M, const double* __restrict__ pos, const int* __restrict__ pairs,
+    const double a, const double Lx, const double Ly, const double Lz,
+    const double debye_cut, const double f0, const double f1, const double f2,
+    const double* __restrict__ xi, double* __restrict__ ypair, int* __restrict__ flag)
+{
+  const int p = blockDim.x * blockIdx.x + threadIdx.x;
+  if (p >= M) return;
+  const int i = pairs[2*p], k = pairs[2*p + 1];
+  double d[3];
+  lub_separation(pos, i, k, a, Lx, Ly, Lz, d);
+  const double r = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+  if (!(r < LUB_PAIR_CUTOFF)) {        // buffered pattern: no contribution
+    for (int t = 0; t < 12; ++t) ypair[12*p + t] = 0.0;
+    flag[p] = 0;
+    return;
+  }
+  const double rh[3] = {d[0]/r, d[1]/r, d[2]/r};
+  const double eps = fmax(r - 2.0, debye_cut);
+  double m1[5], s1[5], m2[5], s2[5];
+  lub_scalars_self<false>(eps, m1);
+  lub_scalars_self<true>(eps, s1);
+  lub_scalars_pair<false>(eps, m2);
+  lub_scalars_pair<true>(eps, s2);
+  // Delta_R parts (R_Sup - R_MB) of this pair, as in lub_diag / lub_offdiag:
+  //   self block of i: [[A11, [b x]], [[b x]^T, C11]],  b = -f1 Y11B r_hat
+  //   self block of k: the same with b -> -b (r_hat -> -r_hat)
+  //   coupling (i,k) : [[A12, [c x]], [[c x], C12]],   c = f1 Y12B r_hat
+  double b[3], c[3];
+  for (int q = 0; q < 3; ++q) {
+    b[q] = -f1*(s1[2]*rh[q]) - (-f1*(m1[2]*rh[q]));
+    c[q] = f1*(s2[2]*rh[q]) - f1*(m2[2]*rh[q]);
+  }
+  double S[6][6], X[6][6];               // self block of i, coupling block (i,k)
+  for (int u = 0; u < 3; ++u) {
+    for (int v = 0; v < 3; ++v) {
+      S[u][v]     = lub_xy(f0, s1[0], s1[1], rh, u, v) - lub_xy(f0, m1[0], m1[1], rh, u, v);
+      S[3+u][3+v] = lub_xy(f2, s1[3], s1[4], rh, u, v) - lub_xy(f2, m1[3], m1[4], rh, u, v);
+      S[u][3+v]   = lub_cross(b, u, v);
+      S[3+u][v]   = lub_cross(b, v, u);
+      X[u][v]     = lub_xy(f0, s2[0], s2[1], rh, u, v) - lub_xy(f0, m2[0], m2[1], rh, u, v);
+      X[3+u][3+v] = lub_xy(f2, s2[3], s2[4], rh, u, v) - lub_xy(f2, m2[3], m2[4], rh, u, v);
+      X[u][3+v]   = lub_cross(c, u, v);
+      X[3+u][v]   = lub_cross(c, u, v);
+    }
+  }
+  // packed lower triangle of [[S_i, X], [X^T, S_k]];  S_k = S_i with b -> -b
+  double Lp[78];
+  for (int rr = 0; rr < 12; ++rr) {
+    for (int cc = 0; cc <= rr; ++cc) {
+      double v;
+      if (rr < 6)       v = S[rr][cc];                        // S_i
+      else if (cc < 6)  v = X[cc][rr - 6];                    // X^T
+      else {                                                  // S_k
+        const int u = rr - 6, w = cc - 6;
+        v = ((u < 3) != (w < 3)) ? -S[u][w] : S[u][w];
+      }
+      Lp[rr*(rr+1)/2 + cc] = v;
+    }
+  }
+  flag[p] = lub_chol_psd<12>(Lp);
+  for (int rr = 0; rr < 12; ++rr) {
+    double y = 0.0;
+    for (int cc = 0; cc <= rr; ++cc) y += Lp[rr*(rr+1)/2 + cc] * xi[12*p + cc];
+    ypair[12*p + rr] = y;
+  }
+}
+
+extern "C" __global__ void lub_noise_gather(
+    const int N, const double* __restrict__ pos,
+    const int* __restrict__ bcol, const int* __restrict__ bptr,
+    const int* __restrict__ bpair, const int* __restrict__ bside,
+    const double a, const double debye_cut, const double f0, const double f1, const double f2,
+    const double sF, const double sT,
+    const double* __restrict__ eta, const double* __restrict__ ypair,
+    double* __restrict__ out, int* __restrict__ flag)
+{
+  const int i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i >= N) return;
+  // Delta_R wall block (lub_diag: (RPY + DR) - RPY = DR terms) + diag(shift)
+  double rpy[5], dw[5];
+  lub_wall_scalars(pos[3*i + 2] / a, debye_cut, rpy, dw);
+  const double Ad[3] = {f0*dw[1], f0*dw[1], f0*dw[0]};
+  const double Cd[3] = {f2*dw[4], f2*dw[4], f2*dw[3]};
+  const double bw[3] = {0.0, 0.0, -(f1*dw[2])};
+  double Lp[21];
+  for (int rr = 0; rr < 6; ++rr) {
+    for (int cc = 0; cc <= rr; ++cc) {
+      double v;
+      if (rr < 3)       v = (rr == cc) ? Ad[rr] + sF : 0.0;
+      else if (cc < 3)  v = lub_cross(bw, cc, rr - 3);        // [b x]^T
+      else              v = (rr == cc) ? Cd[rr - 3] + sT : 0.0;
+      Lp[rr*(rr+1)/2 + cc] = v;
+    }
+  }
+  flag[i] = lub_chol_psd<6>(Lp);
+  double y[6];
+  for (int rr = 0; rr < 6; ++rr) {
+    double v = 0.0;
+    for (int cc = 0; cc <= rr; ++cc) v += Lp[rr*(rr+1)/2 + cc] * eta[6*i + cc];
+    y[rr] = v;
+  }
+  for (int bb = bptr[i]; bb < bptr[i+1]; ++bb) {
+    const int p = bpair[bb];
+    if (p < 0) continue;                 // diagonal block
+    const double* yp = ypair + 12*p + 6*bside[bb];
+    for (int rr = 0; rr < 6; ++rr) y[rr] += yp[rr];
+  }
+  for (int rr = 0; rr < 6; ++rr) out[6*i + rr] = y[rr];
+}
+"""
+
+_PAIR_CUTOFF = 4.5      # fits are only valid to 4.5a -- do not change
+
+
+def _default_xp():
+    import cupy
+    return cupy
+
+
+def _default_sparse():
+    import cupyx.scipy.sparse
+    return cupyx.scipy.sparse
+
+
+def _copy_h2d(dst, src):
+    """Copy a host array into an existing (contiguous) device buffer view."""
+    src = np.ascontiguousarray(src, dtype=dst.dtype)
+    if hasattr(dst, 'set'):          # cupy.ndarray
+        dst.set(src)
+    else:                            # numpy (CPU validation backend)
+        dst[...] = src
+
 
 # =============================================================================
-# GPU-resident index maps for pair block assembly — built once at module load
+# Block pattern (host side)
 # =============================================================================
-_BLK_R_OFF   = cp.array([0, 6, 0, 6], dtype=cp.int32)
-_BLK_C_OFF   = cp.array([0, 6, 6, 0], dtype=cp.int32)
-_lr, _lc     = cp.meshgrid(cp.arange(6, dtype=cp.int32),
-                            cp.arange(6, dtype=cp.int32), indexing='ij')
-_LOCAL_ROW   = _lr.ravel()                                    # (36,)
-_LOCAL_COL   = _lc.ravel()
-_ENTRY_BLOCK = cp.repeat(cp.arange(4, dtype=cp.int32), 36)   # (144,)
-_ENTRY_LROW  = cp.tile(_LOCAL_ROW, 4)                        # (144,)
-_ENTRY_LCOL  = cp.tile(_LOCAL_COL, 4)
-_G_EMROW     = (_BLK_R_OFF[_ENTRY_BLOCK] + _ENTRY_LROW).astype(cp.int32)
-_G_EMCOL     = (_BLK_C_OFF[_ENTRY_BLOCK] + _ENTRY_LCOL).astype(cp.int32)
-
-# =============================================================================
-# Default dtype and coefficient cache
-# =============================================================================
-# Change this to cp.float64 to make float64 the default for all new instances.
-_DEFAULT_DTYPE = cp.float32
-
-# Arrays that need to be cast per-dtype.  int32 index maps are dtype-agnostic.
-_FLOAT_COEFF_NAMES = (
-    '_RPY_P', '_RPY_Q',
-    '_DR_P',  '_DR_Q',  '_DR_ASYM_CUT', '_DR_RPY_CUT',
-    '_CF_SUP', '_CF_MB',
-)
-
-# Cache: dtype -> dict of name -> cast array.  Built on first use per dtype.
-_COEFF_CACHE: dict = {}
-
-
-def _get_coeffs(dtype):
+class BlockPattern:
     """
-    Return a dict of all float coefficient arrays cast to `dtype`.
-    Results are cached so the cast is paid at most once per dtype.
-    """
-    if dtype not in _COEFF_CACHE:
-        g = globals()
-        _COEFF_CACHE[dtype] = {
-            name: cp.asarray(g[name], dtype=dtype)
-            for name in _FLOAT_COEFF_NAMES
-        }
-    return _COEFF_CACHE[dtype]
-
-# =============================================================================
-# GPU helper functions — all dtype-aware via C (cached coeff dict)
-# =============================================================================
-
-def _eval_rat_wall_all(h_gpu, h_scale, p_gpu, q_gpu, pmin_arr, np_arr, nq_arr):
-    """All 5 wall rational fits simultaneously. dtype follows h_gpu."""
-    dtyp   = h_gpu.dtype
-    eps_fl = cp.finfo(dtyp).tiny
-    u      = 1.0 / (1.0 + h_gpu[None, :] / h_scale)
-    pmin_f = pmin_arr.astype(dtyp)[:, None]
-    upow   = cp.exp(pmin_f * cp.log(cp.maximum(u, eps_fl)))
-    P      = cp.zeros((5, h_gpu.shape[0]), dtype=dtyp)
-    for i in range(p_gpu.shape[1]):
-        P    += cp.where((np_arr > i)[:, None], p_gpu[:, i:i+1] * upow, 0.0)
-        upow  = upow * u
-    Q      = cp.ones((5, h_gpu.shape[0]), dtype=dtyp)
-    upow   = u.copy()
-    for i in range(q_gpu.shape[1]):
-        Q    += cp.where((nq_arr > i)[:, None], q_gpu[:, i:i+1] * upow, 0.0)
-        upow  = upow * u
-    return P / Q
-
-
-def _rpy_wall_batch(h_gpu, C):
-    """All 5 RPY wall scalars. Returns (5, W)."""
-    return _eval_rat_wall_all(h_gpu, _RPY_HSCALE,
-                              C['_RPY_P'], C['_RPY_Q'],
-                              _RPY_PMIN, _RPY_NP, _RPY_NQ)
-
-
-def _asym_wall_batch(eps_gpu):
-    """AT asymptotics for all 5 wall scalars. Returns (5, W)."""
-    dtyp = eps_gpu.dtype
-    efl = cp.finfo(dtyp).tiny
-    le  = cp.log(cp.maximum(eps_gpu, efl))
-    out = cp.empty((5, eps_gpu.shape[0]), dtype=dtyp)
-    out[0] = 1.0/eps_gpu - (1.0/5.0)*le + 0.971280 - 1.0
-    out[1] = -(8.0/15.0)*le + 0.9588 - 1.0
-    out[2] = (4.0/3.0)*((1.0/10.0)*le + 0.1895 - 0.029 - (0.4576-0.2)*eps_gpu)
-    out[3] = (4.0/3.0)*(1.20206 - 3.0*6.449340668482264e-01*eps_gpu) - 4.0/3.0
-    out[4] = (4.0/3.0)*(-(2.0/5.0)*le + 0.3817 + 1.4578*eps_gpu) - 4.0/3.0
-    return out
-
-
-def _delta_R_wall_batch(eps_gpu, h_gpu, rpy_scalars, C):
-    """Chimera Delta_R for all 5 wall scalars. Returns (5, W)."""
-    dr_fit = _eval_rat_wall_all(h_gpu, _DR_HSCALE,
-                                C['_DR_P'], C['_DR_Q'],
-                                _DR_PMIN, _DR_NP, _DR_NQ)
-    asym   = _asym_wall_batch(eps_gpu)
-    e      = eps_gpu[None, :]
-    near   = e < C['_DR_ASYM_CUT'][:, None]
-    mid    = (~near) & (e <= C['_DR_RPY_CUT'][:, None])
-    out    = cp.zeros_like(rpy_scalars)
-    out    = cp.where(near, asym - rpy_scalars, out)
-    out    = cp.where(mid,  dr_fit,             out)
-    return out
-
-
-def _wall_matrices_batch(h_wall, eps_wall, f0, f1, f2, C):
-    """Returns R_rpy (W,6,6) and R_sup (W,6,6) in h_wall.dtype.
-    Rational fits always evaluated in float64 to avoid catastrophic cancellation
-    between RPY and Delta_R at small gaps, then cast back to working dtype.
-    Cost is negligible — only N particles, not M pairs.
-    """
-    dtyp = h_wall.dtype
-    W    = h_wall.shape[0]
-    C64  = _get_coeffs(cp.float64)
-    h64  = h_wall.astype(cp.float64)
-    e64  = eps_wall.astype(cp.float64)
-    rpy  = _rpy_wall_batch(h64, C64).astype(dtyp)
-    dR   = _delta_R_wall_batch(e64, h64,
-                               rpy.astype(cp.float64), C64).astype(dtyp)
-
-    def fill_6x6(Xa, Ya, Yb, Xc, Yc):
-        R = cp.zeros((W, 6, 6), dtype=dtyp)
-        R[:, 0, 0] = f0*Ya;  R[:, 1, 1] = f0*Ya;  R[:, 2, 2] = f0*Xa
-        R[:, 3, 3] = f2*Yc;  R[:, 4, 4] = f2*Yc;  R[:, 5, 5] = f2*Xc
-        R[:, 0, 4] =  f1*Yb; R[:, 4, 0] =  f1*Yb
-        R[:, 1, 3] = -f1*Yb; R[:, 3, 1] = -f1*Yb
-        return R
-
-    R_rpy = fill_6x6(rpy[0], rpy[1], rpy[2], rpy[3], rpy[4])
-    R_sup = fill_6x6(rpy[0]+dR[0], rpy[1]+dR[1], rpy[2]+dR[2],
-                     rpy[3]+dR[3], rpy[4]+dR[4])
-    return R_rpy, R_sup
-
-
-def _eval_pair_PQ_batch(cf_gpu, eps, ep, eq):
-    """P/Q for pair scalars; Q uses c_i^2. Returns (10, M)."""
-    p = cf_gpu[:, 1:7]
-    c = cf_gpu[:, 7:12]
-    P = cp.einsum('si,mi->sm', p, ep)
-    Q = 1.0 + cp.einsum('si,mi->sm', c*c, eq)
-    return P / Q
-
-
-def _pair_scalars_batch(r_norms, debye_cut, cf_gpu, is_sup):
-    """All 10 pair scalars for M pairs. Returns (10, M)."""
-    dtyp = r_norms.dtype
-    efl  = cp.finfo(dtyp).tiny
-    eps  = cp.maximum(r_norms - 2.0, debye_cut)
-    eps2 = eps*eps; eps3=eps2*eps; eps4=eps3*eps; eps5=eps4*eps
-    ep   = cp.stack([cp.ones_like(eps), eps, eps2, eps3, eps4, eps5], axis=1)
-    eq   = ep[:, 1:]
-
-    raw = _eval_pair_PQ_batch(cf_gpu, eps, ep, eq)
-    raw[0] =  0.25/eps + raw[0]/eps
-    raw[1] = -0.25/eps + raw[1]/eps
-
-    if is_sup:
-        li  = cp.log(1.0 / cp.maximum(eps, efl))
-        at  = cp.stack([
-             0.995419 + 0.25/eps + 0.225*li + 0.0267857*eps*li,
-            -0.350153 - 0.25/eps - 0.225*li - 0.0267857*eps*li,
-             0.998317 + 0.166667*li,
-            -0.273652 - 0.166667*li,
-            -0.666667*(0.23892 - 0.25*li - 0.125*eps*li),
-             0.666667*(-0.00162268 + 0.25*li + 0.125*eps*li),
-             1.33333*(1.0518 - 0.125*eps*li),
-             1.33333*(-0.150257 + 0.125*eps*li),
-             1.33333*(0.702834 + 0.2*li + 0.188*eps*li),
-             1.33333*(-0.027464 + 0.05*li + 0.062*eps*li),
-        ], axis=0)
-        use_at = eps[None, :] < cf_gpu[:, 0:1]
-        raw    = cp.where(use_at, at, raw)
-
-    raw[5] = -raw[5]
-    return raw
-
-
-def _assemble_pair_triplets(scalars, j_idx, k_idx, n_dof, f0, f1, f2, r_hat_gpu):
-    """Build COO triplets for M pairs. Returns (rows, cols, vals)."""
-    dtyp = r_hat_gpu.dtype
-    M  = r_hat_gpu.shape[0]
-    rh = r_hat_gpu
-
-    X11A,X12A,Y11A,Y12A,Y11B,Y12B,X11C,X12C,Y11C,Y12C = [scalars[i] for i in range(10)]
-
-    sq = cp.einsum('mi,mj->mij', rh, rh)
-    sh = cp.eye(3, dtype=dtyp)[None] - sq
-    vt = cp.zeros((M, 3, 3), dtype=dtyp)
-    vt[:, 0, 1] =  rh[:, 2];  vt[:, 0, 2] = -rh[:, 1]
-    vt[:, 1, 0] = -rh[:, 2];  vt[:, 1, 2] =  rh[:, 0]
-    vt[:, 2, 0] =  rh[:, 1];  vt[:, 2, 1] = -rh[:, 0]
-    vt *= -1.0
-
-    def blk(X, Y): return X[:, None, None]*sq + Y[:, None, None]*sh
-
-    A11 = f0*blk(X11A,Y11A);  A12 = f0*blk(X12A,Y12A)
-    B11 = -f1*Y11B[:, None, None]*vt
-    B12 =  f1*Y12B[:, None, None]*vt
-    C11 = f2*blk(X11C,Y11C);  C12 = f2*blk(X12C,Y12C)
-
-    R = cp.zeros((M, 12, 12), dtype=dtyp)
-    R[:,  0:3,  0:3] = A11;  R[:,  0:3,  3:6] = B11
-    R[:,  0:3,  6:9] = A12;  R[:,  0:3, 9:12] = B12
-    R[:,  3:6,  0:3] =-B11;  R[:,  3:6,  3:6] = C11
-    R[:,  3:6,  6:9] = B12;  R[:,  3:6, 9:12] = C12
-    R[:,  6:9,  0:3] = A12;  R[:,  6:9,  3:6] =-B12
-    R[:,  6:9,  6:9] = A11;  R[:,  6:9, 9:12] =-B11
-    R[:, 9:12,  0:3] =-B12;  R[:, 9:12,  3:6] = C12
-    R[:, 9:12,  6:9] = B11;  R[:, 9:12, 9:12] = C11
-
-    vals = R[:, _G_EMROW, _G_EMCOL]
-
-    j6 = j_idx * 6;  k6 = k_idx * 6
-    dof_r = cp.stack([j6, k6, j6, k6], axis=1)
-    dof_c = cp.stack([j6, k6, k6, j6], axis=1)
-    rows  = dof_r[:, _ENTRY_BLOCK] + _ENTRY_LROW[None, :]
-    cols  = dof_c[:, _ENTRY_BLOCK] + _ENTRY_LCOL[None, :]
-
-    rows = rows.ravel();  cols = cols.ravel();  vals = vals.ravel()
-    # dtype-appropriate zero threshold
-    thr  = 1e-6 if dtyp == cp.float32 else 1e-12
-    mask = cp.abs(vals) > thr
-    return rows[mask].astype(cp.int32), cols[mask].astype(cp.int32), vals[mask]
-
-
-def _build_coo(rows_list, cols_list, vals_list, n_dof):
-    """Concatenate triplet lists into a cupyx COO matrix."""
-    if vals_list:
-        r = cp.concatenate(rows_list).astype(cp.int32)
-        c = cp.concatenate(cols_list).astype(cp.int32)
-        v = cp.concatenate(vals_list)
-    else:
-        r = cp.empty(0, dtype=cp.int32)
-        c = cp.empty(0, dtype=cp.int32)
-        v = cp.empty(0, dtype=cp.float32)
-    return cpsp.coo_matrix((v, (r, c)), shape=(n_dof, n_dof))
-
-
-class Lubrication:
-    """
-    CuPy-vectorised lubrication resistance matrix.
-    Drop-in replacement for the C++ nanobind Lubrication class.
+    6x6 block sparsity pattern of the lubrication matrices.
 
     Parameters
     ----------
-    d_cut : float
-        Debye (minimum epsilon) cutoff.
-    dtype : cp.dtype, optional
-        Floating-point precision for all GPU computations.
-        Default: cp.float32.  Pass cp.float64 for double precision.
-        If r_gpu is supplied to ResistCSC_both with a different dtype,
-        that dtype takes precedence for that call.
+    N     : number of particles
+    pairs : (M, 2) integer array of unique pairs (i, k) with i != k.  Order and
+            orientation do not matter; self.pairs holds them as sorted (lo, hi).
+    version : integer tag; anything that caches a factorisation of a matrix
+            with this pattern (cuDSS plan, CHOLMOD symbolic) keys on it.
+
+    Attributes (all numpy int32)
+    ----------------------------
+    bptr  (N+1,)  block-row pointer
+    bcol  (nb,)   block column of each block (sorted inside each row)
+    brow  (nb,)   block row of each block
+    bdiag (N,)    index of the diagonal block of each row
+    bpair (nb,)   pair index (into self.pairs) of each block, -1 for diagonal blocks
+    bside (nb,)   0 for block (lo, hi), 1 for block (hi, lo), -1 for diagonal blocks
+    nb = N + 2M blocks, nnz = 36 nb scalar entries.
     """
 
-    def __init__(self, d_cut: float, dtype=None):
+    def __init__(self, N, pairs, version=0):
+        N = int(N)
+        pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+        if pairs.size:
+            lo = np.minimum(pairs[:, 0], pairs[:, 1])
+            hi = np.maximum(pairs[:, 0], pairs[:, 1])
+            if np.any(lo == hi) or lo.min() < 0 or hi.max() >= N:
+                raise ValueError('invalid pair list')
+            srt = np.lexsort((hi, lo))
+            lo, hi = lo[srt], hi[srt]
+        else:
+            lo = hi = np.empty(0, dtype=np.int64)
+        diag = np.arange(N, dtype=np.int64)
+        rows = np.concatenate([lo, hi, diag])
+        cols = np.concatenate([hi, lo, diag])
+        key = rows * N + cols
+        order = np.argsort(key, kind='stable')
+        ks = key[order]
+        if ks.size > 1 and not np.all(ks[1:] > ks[:-1]):
+            raise ValueError('duplicate pairs in pair list')
+        self.N = N
+        self.n_pairs = int(lo.size)
+        self.nb = int(rows.size)
+        self.nnz = 36 * self.nb
+        self.n_dof = 6 * N
+        if self.nnz >= 2**31 - 1:
+            raise ValueError('pattern too large for int32 CSR indices')
+        self.brow = rows[order].astype(np.int32)
+        self.bcol = cols[order].astype(np.int32)
+        bptr = np.zeros(N + 1, dtype=np.int64)
+        np.cumsum(np.bincount(rows, minlength=N), out=bptr[1:])
+        self.bptr = bptr.astype(np.int32)
+        self.bdiag = np.flatnonzero(self.brow == self.bcol).astype(np.int32)
+        self.pairs = np.stack([lo, hi], axis=1).astype(np.int32) if lo.size \
+            else np.empty((0, 2), dtype=np.int32)
+        # sorted position of every unsorted block: rows = [lo, hi, diag], so the
+        # first M are the (lo, hi) blocks of the pairs and the next M the (hi, lo)
+        where = np.empty(self.nb, dtype=np.int64)
+        where[order] = np.arange(self.nb)
+        M = lo.size
+        self.bpair = np.full(self.nb, -1, dtype=np.int32)
+        self.bside = np.full(self.nb, -1, dtype=np.int32)
+        if M:
+            self.bpair[where[:M]] = self.bpair[where[M:2 * M]] = np.arange(M, dtype=np.int32)
+            self.bside[where[:M]], self.bside[where[M:2 * M]] = 0, 1
+        self.version = int(version)
+
+    def scalar_csr_host(self):
+        """(indptr, indices) of the scalar CSR on the host (reference/tests)."""
+        N, deg = self.N, np.diff(self.bptr).astype(np.int64)
+        lr = np.arange(6)
+        indptr = np.empty(6 * N + 1, dtype=np.int64)
+        indptr[:-1] = (36 * self.bptr[:-1, None].astype(np.int64)
+                       + lr[None, :] * 6 * deg[:, None]).ravel()
+        indptr[-1] = self.nnz
+        indices = np.empty(self.nnz, dtype=np.int64)
+        for i in range(N):
+            cols = (6 * self.bcol[self.bptr[i]:self.bptr[i + 1]][:, None]
+                    + lr[None, :]).ravel()
+            start = 36 * self.bptr[i]
+            for r in range(6):
+                s = start + r * 6 * deg[i]
+                indices[s:s + cols.size] = cols
+        return indptr.astype(np.int32), indices.astype(np.int32)
+
+
+# =============================================================================
+# Assembler (device side)
+# =============================================================================
+class LubricationAssembler:
+    """
+    Persistent device buffers + fused kernels for the lubrication matrices.
+
+    Parameters
+    ----------
+    debye_cut : minimum gap (units of a) used in the fits
+    a, eta    : particle radius and viscosity
+    small_F, small_T : diagonal shift added to R_SupS and Delta_RS
+                (6 pi eta a tol and 8 pi eta a^3 tol in the solver)
+    headroom  : value/index buffers are allocated with this much spare
+                capacity so a slightly larger pattern does not reallocate.
+
+    After set_pattern(p):  R_MB, R_SupS, Delta_R, Delta_RS are CSR matrices
+    (cupyx) sharing one indptr/indices; assemble(pos, L) refreshes their
+    values in place.
+    """
+
+    BLOCK = 128
+
+    def __init__(self, debye_cut, a, eta, small_F=0.0, small_T=0.0, *,
+                 xp=None, sparse=None, headroom=1.25):
+        self.xp = xp if xp is not None else _default_xp()
+        self.sparse = sparse if sparse is not None else _default_sparse()
+        self.debye_cut = float(debye_cut)
+        self.a = float(a)
+        self.eta = float(eta)
+        # same expressions (and evaluation order) as lubrication.cpp
+        self.f0 = 6.0 * np.pi * eta * a
+        self.f1 = 6.0 * np.pi * eta * a * a
+        self.f2 = 6.0 * np.pi * eta * a * a * a
+        self.small_F = float(small_F)
+        self.small_T = float(small_T)
+        self.headroom = float(headroom)
+        self.pattern = None
+        self._version = 0
+        self._mod = None
+        self._cap_nnz = self._cap_nb = self._cap_n = -1
+        self.R_MB = self.R_SupS = self.Delta_R = self.Delta_RS = None
+        self.n_pattern_builds = 0
+        self.n_assemblies = 0
+
+    # ---- kernel plumbing (overridden by the CPU validation backend) ---------
+    def _kernel(self, name):
+        if self._mod is None:
+            self._mod = self.xp.RawModule(code=KERNEL_SOURCE)
+        return self._mod.get_function(name)
+
+    def _launch(self, name, n_threads, args):
+        if n_threads <= 0:
+            return
+        grid = ((n_threads + self.BLOCK - 1) // self.BLOCK,)
+        self._kernel(name)(grid, (self.BLOCK,), args)
+
+    # ---- buffers -----------------------------------------------------------
+    def _ensure_capacity(self, nnz, nb, N):
+        # Grow-only with headroom, but also shrink when less than half is used
+        # (keeps memory bounded, and scipy -- used by the CPU tests -- copies
+        # views of much larger arrays instead of aliasing them).
+        xp, h = self.xp, self.headroom
+        if nnz > self._cap_nnz or 2 * nnz < self._cap_nnz:
+            cap = int(nnz * h) + 36
+            self._vals = [xp.empty(cap, dtype=xp.float64) for _ in range(4)]
+            self._indices = xp.empty(cap, dtype=xp.int32)
+            self._cap_nnz = cap
+        if nb > self._cap_nb:
+            cap = int(nb * h) + 1
+            self._d_brow = xp.empty(cap, dtype=xp.int32)
+            self._d_bcol = xp.empty(cap, dtype=xp.int32)
+            self._cap_nb = cap
+        if N > self._cap_n:
+            self._d_bptr = xp.empty(N + 1, dtype=xp.int32)
+            self._d_bdiag = xp.empty(N, dtype=xp.int32)
+            self._indptr = xp.empty(6 * N + 1, dtype=xp.int32)
+            self._cap_n = N
+
+    @staticmethod
+    def _same_buffer(x, y):
+        if hasattr(x, 'data') and hasattr(x.data, 'ptr'):          # cupy
+            return x.data.ptr == y.data.ptr and x.size == y.size
+        return np.shares_memory(x, y) and x.size == y.size        # numpy
+
+    def _make_csr(self, data, indices, indptr, n):
+        M = self.sparse.csr_matrix((data, indices, indptr), shape=(n, n), copy=False)
+        # The matrices must be views of the persistent buffers, otherwise
+        # assemble() would not update them.  Fail loudly if a sparse library
+        # version decides to copy.
+        if not (self._same_buffer(M.data, data) and self._same_buffer(M.indices, indices)
+                and self._same_buffer(M.indptr, indptr)):
+            raise RuntimeError('sparse matrix constructor copied the CSR buffers; '
+                               'in-place assembly would be lost')
+        try:                          # skip the lazy canonical-format check
+            M.has_canonical_format = True
+        except (AttributeError, TypeError):
+            pass
+        return M
+
+    def set_pattern(self, pattern):
+        """Upload a BlockPattern and build the scalar CSR structure on device."""
+        p = pattern
+        self._ensure_capacity(p.nnz, p.nb, p.N)
+        nb, N, nnz, n = p.nb, p.N, p.nnz, p.n_dof
+        _copy_h2d(self._d_brow[:nb], p.brow)
+        _copy_h2d(self._d_bcol[:nb], p.bcol)
+        _copy_h2d(self._d_bptr[:N + 1], p.bptr)
+        _copy_h2d(self._d_bdiag[:N], p.bdiag)
+        self._d_pairs = self.xp.asarray(np.ascontiguousarray(p.pairs.reshape(-1)))
+        self._d_bpair = self.xp.asarray(p.bpair)
+        self._d_bside = self.xp.asarray(p.bside)
+        ind, ptr = self._indices[:nnz], self._indptr[:n + 1]
+        self._launch('lub_csr_indices', nb,
+                     (np.int32(nb), self._d_brow, self._d_bcol, self._d_bptr, ind))
+        self._launch('lub_csr_indptr', n + 1, (np.int32(N), self._d_bptr, ptr))
+        v = self._vals
+        self.vMB, self.vSS, self.vDR, self.vDRS = (v[0][:nnz], v[1][:nnz],
+                                                   v[2][:nnz], v[3][:nnz])
+        self.indices, self.indptr = ind, ptr
+        self.R_MB = self._make_csr(self.vMB, ind, ptr, n)
+        self.R_SupS = self._make_csr(self.vSS, ind, ptr, n)
+        self.Delta_R = self._make_csr(self.vDR, ind, ptr, n)
+        self.Delta_RS = self._make_csr(self.vDRS, ind, ptr, n)
+        self.pattern = p
+        self.n_pattern_builds += 1
+
+    def set_pairs(self, N, pairs):
+        """
+        Use the block pattern of a pair list (any order or orientation).  If
+        the list equals the current one nothing happens, so pattern_version
+        (the key for cached factorisations) only changes when the sparsity
+        pattern does.  Returns True when a new pattern was built.
+        """
+        pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+        if pairs.size:
+            lo = np.minimum(pairs[:, 0], pairs[:, 1])
+            hi = np.maximum(pairs[:, 0], pairs[:, 1])
+            srt = np.lexsort((hi, lo))
+            pairs = np.stack([lo[srt], hi[srt]], axis=1)
+        p = self.pattern
+        if p is not None and p.N == N and p.pairs.shape == pairs.shape \
+                and np.array_equal(p.pairs, pairs):
+            return False
+        self._version += 1
+        self.set_pattern(BlockPattern(N, pairs, version=self._version))
+        return True
+
+    @property
+    def pattern_version(self):
+        return None if self.pattern is None else self.pattern.version
+
+    def assemble(self, pos, periodic_length, length_unit=None):
+        """
+        Refresh all four matrices for positions ``pos``.
+
+        pos : device (N, 3) float64, C-contiguous, wrapped into the periodic box.
+        periodic_length : 3 floats (<= 0: open direction), same units as pos.
+        length_unit : scale that makes positions dimensionless (default a).
+            Pass 1.0 when pos is already in units of a.
+        """
+        p = self.pattern
+        if p is None:
+            raise RuntimeError('set_pattern() must be called first')
+        if pos.shape != (p.N, 3) or pos.dtype != np.float64 or not pos.flags.c_contiguous:
+            raise ValueError('pos must be a C-contiguous (N,3) float64 array')
+        unit = self.a if length_unit is None else float(length_unit)
+        L = [float(x) if float(x) > 0.0 else 0.0 for x in periodic_length]
+        geo = (np.float64(unit), np.float64(L[0]), np.float64(L[1]), np.float64(L[2]),
+               np.float64(self.debye_cut), np.float64(self.f0),
+               np.float64(self.f1), np.float64(self.f2))
+        outs = (self.vMB, self.vSS, self.vDR, self.vDRS)
+        self.pos, self.periodic_length = pos, periodic_length     # last assembled configuration
+        self._launch('lub_offdiag', p.nb,
+                     (np.int32(p.nb), pos, self._d_brow, self._d_bcol, self._d_bptr)
+                     + geo + outs)
+        self._launch('lub_diag', p.N,
+                     (np.int32(p.N), pos, self._d_bcol, self._d_bptr, self._d_bdiag)
+                     + geo + (np.float64(self.small_F), np.float64(self.small_T)) + outs)
+        self.n_assemblies += 1
+
+    def brownian(self, pos, periodic_length, normals=None, length_unit=None):
+        """
+        Gaussian vector with covariance Delta_R + diag(small) (= Delta_RS),
+        drawn pair by pair: Delta_R is a sum of positive semi-definite 12x12
+        pair blocks and 6x6 wall blocks, so with the Cholesky factors B_p and
+        C_i of the pair blocks and of (wall block + small),
+            y = sum_p B_p xi_p + sum_i C_i eta_i
+        has exactly that covariance.  No global factorisation.
+
+        pos, periodic_length, length_unit : as in assemble() (same positions).
+        normals : 12*n_pairs + 6*N standard normals (xi_0, xi_1, ..., eta_0, ...)
+                  in the array module of the assembler; drawn if None.
+        Returns the (6N,) vector.  noise_clipped counts blocks that were not
+        positive semi-definite in this draw (expected 0).
+        """
+        p = self.pattern
+        if p is None:
+            raise RuntimeError('set_pattern() must be called first')
+        if pos.shape != (p.N, 3) or pos.dtype != np.float64 or not pos.flags.c_contiguous:
+            raise ValueError('pos must be a C-contiguous (N,3) float64 array')
+        xp, M, N = self.xp, p.n_pairs, p.N
+        if normals is None:
+            normals = xp.random.standard_normal(12 * M + 6 * N)
+        normals = xp.ascontiguousarray(normals, dtype=xp.float64).reshape(-1)
+        if normals.size != 12 * M + 6 * N:
+            raise ValueError(f'expected {12 * M + 6 * N} normals, got {normals.size}')
+        unit = self.a if length_unit is None else float(length_unit)
+        L = [float(x) if float(x) > 0.0 else 0.0 for x in periodic_length]
+        f8 = np.float64
+        ypair = xp.zeros(12 * max(M, 1), dtype=xp.float64)
+        flags = xp.zeros(M + N, dtype=xp.int32)
+        out = xp.empty(6 * N, dtype=xp.float64)
+        self._launch('lub_noise_pairs', M,
+                     (np.int32(M), pos, self._d_pairs, f8(unit), f8(L[0]), f8(L[1]), f8(L[2]),
+                      f8(self.debye_cut), f8(self.f0), f8(self.f1), f8(self.f2),
+                      normals, ypair, flags))
+        self._launch('lub_noise_gather', N,
+                     (np.int32(N), pos, self._d_bcol, self._d_bptr, self._d_bpair, self._d_bside,
+                      f8(unit), f8(self.debye_cut), f8(self.f0), f8(self.f1), f8(self.f2),
+                      f8(self.small_F), f8(self.small_T), normals[12 * M:], ypair, out,
+                      flags[M:]))
+        self._noise_flags = flags
+        return out
+
+    def pair_gaps(self):
+        """Host array: surface gap / a of every pair of the pattern (self.pattern.pairs)
+        at the positions of the last assemble() call (minimum image)."""
+        p = self.pattern
+        pos = np.asarray(self.pos.get() if hasattr(self.pos, 'get') else self.pos)
+        d = pos[p.pairs[:, 1]] - pos[p.pairs[:, 0]]
+        for l, Ll in enumerate(self.periodic_length):
+            if float(Ll) > 0.0:
+                d[:, l] -= np.round(d[:, l] / float(Ll)) * float(Ll)
+        return np.sqrt(np.sum(d * d, axis=1)) / self.a - 2.0
+
+    @property
+    def noise_clipped(self):
+        """Blocks that were not positive semi-definite in the last brownian() call."""
+        f = getattr(self, '_noise_flags', None)
+        return 0 if f is None else int(f.sum())
+
+    @property
+    def R_Sup(self):
+        """R_Sup without the diagonal shift (built on demand, for inspection)."""
+        n = self.pattern.n_dof
+        s = self.xp.tile(self.xp.asarray([self.small_F] * 3 + [self.small_T] * 3,
+                                         dtype=self.xp.float64), self.pattern.N)
+        return self.R_SupS - self.sparse.diags(s, 0, shape=(n, n), format='csr')
+
+
+# =============================================================================
+# Drop-in replacement for lubrication_cupy.Lubrication
+# =============================================================================
+class Lubrication:
+    """
+    Same call signature as lubrication_cupy.Lubrication.ResistCSC_both, backed
+    by the fused kernels.  Returns fresh (R_MB, R_Sup) cupyx CSC matrices.
+    The fast solver (cupyStokesianDynamics_fast) uses LubricationAssembler
+    directly and avoids the copies made here.
+    """
+    _PAIR_CUTOFF = _PAIR_CUTOFF
+
+    def __init__(self, d_cut, dtype=None):
+        if dtype is not None and np.dtype(dtype) != np.float64:
+            raise ValueError('the fused kernels are float64 only')
         self.debye_cut = d_cut
-        self.dtype     = dtype if dtype is not None else _DEFAULT_DTYPE
-        # Pre-populate the coeff cache for this dtype on construction
-        self._C = _get_coeffs(self.dtype)
+        self._asm = None
+        self._key = None
 
-    # Physical cutoff for pair rational fits — hardcoded because the fits
-    # are only valid up to this separation.  Do not override.
-    _PAIR_CUTOFF = 4.5
-
-    def ResistCSC(self, r_vectors, n_list, a, eta, cutoff,
-                  wall_cutoff, periodic_length, Sup_if_true):
-        """wall_cutoff and cutoff args accepted for API compatibility but ignored."""
+    def ResistCSC(self, r_vectors, n_list, a, eta, cutoff, wall_cutoff,
+                  periodic_length, Sup_if_true):
         R_MB, R_Sup = self.ResistCSC_both(r_vectors, n_list, a, eta,
                                           periodic_length=periodic_length)
         return R_Sup if Sup_if_true else R_MB
 
-    def ResistCSC_both(self, r_vectors, n_list, a, eta,
-                       cutoff=None, wall_cutoff=None, periodic_length=None,
+    def ResistCSC_both(self, r_vectors, n_list, a, eta, cutoff=None,
+                       wall_cutoff=None, periodic_length=None,
                        r_gpu=None, j_gpu=None, k_gpu=None, pl_gpu=None):
-        """
-        Build both MB and Sup sparse resistance matrices as cupyx CSC on GPU.
-
-        cutoff and wall_cutoff are accepted for API compatibility with the C++
-        nanobind class but are ignored:
-          - pair cutoff is hardcoded to 4.5a (the fit validity range)
-          - wall blocks are always applied to all particles (the rational fits
-            decay smoothly to zero in the far field)
-
-        If r_gpu is provided its dtype overrides self.dtype for this call.
-        """
-        N     = len(r_vectors)
-        n_dof = 6 * N
-
-        # Resolve dtype: r_gpu wins if supplied
-        dtyp = r_gpu.dtype if r_gpu is not None else self.dtype
-        C  = _get_coeffs(dtyp)   # O(1) after first call per dtype
-
-        f0 = cp.dtype(dtyp).type(_6PI * eta * a)
-        f1 = cp.dtype(dtyp).type(_6PI * eta * a * a)
-        f2 = cp.dtype(dtyp).type(_6PI * eta * a * a * a)
-
-        pl_np = np.asarray(periodic_length if periodic_length is not None
+        import cupy as cp
+        import cupyx.scipy.sparse as cpsp
+        if self._asm is None or self._key != (a, eta):
+            self._asm = LubricationAssembler(self.debye_cut, a, eta)
+            self._key = (a, eta)
+        if r_gpu is not None:                 # old fast path: units of a
+            pos = cp.ascontiguousarray(r_gpu, dtype=cp.float64)
+            L = (cp.asnumpy(pl_gpu) if pl_gpu is not None
+                 else np.asarray(periodic_length if periodic_length is not None
+                                 else np.zeros(3), dtype=np.float64))
+            unit = 1.0
+        else:                                 # C++-compatible call: physical units
+            pos = cp.asarray(np.asarray(r_vectors, dtype=np.float64).reshape(-1, 3))
+            L = np.asarray(periodic_length if periodic_length is not None
                            else np.zeros(3), dtype=np.float64)
-        pl_g  = pl_gpu.astype(dtyp) if pl_gpu is not None \
-                else cp.asarray(pl_np, dtype=dtyp)
-
-        # Units: pair separations are taken in units of a (the pair fits and
-        # the 4.5 cutoff are in units of a), so positions and periodic lengths
-        # must both be in units of a. r_gpu / pl_gpu are expected in units of
-        # a already (see cupyStokesianDynamics._build_neighbour_list);
-        # r_vectors / periodic_length are physical (C++-compatible call) and
-        # are scaled here. (Previously periodic_length was not scaled, which
-        # broke the minimum image for a != 1.)
-        if r_gpu is not None:
-            r_g = r_gpu.astype(dtyp) if r_gpu.dtype != dtyp else r_gpu
-        else:
-            r_g = cp.asarray(
-                np.asarray(r_vectors, dtype=np.float64).reshape(N, 3) / a,
-                dtype=dtyp)
-            if pl_gpu is None:
-                pl_g = cp.asarray(pl_np / a, dtype=dtyp)
-
-        rows_mb, cols_mb, vals_mb = [], [], []
-        rows_sup, cols_sup, vals_sup = [], [], []
-
-        # ── Wall blocks: always applied to ALL N particles ────────────────
-        # The rational fits decay smoothly to zero; no cutoff needed.
-        h_all   = r_g[:, 2]
-        eps_all = cp.maximum(h_all - 1.0, cp.dtype(dtyp).type(self.debye_cut))
-        h_all   = 1.0 + eps_all
-
-        R_rpy_blk, R_sup_blk = _wall_matrices_batch(
-            h_all, eps_all, f0, f1, f2, C)
-
-        all_idx = cp.arange(N, dtype=cp.int32)
-        lr, lc  = cp.meshgrid(cp.arange(6, dtype=cp.int32),
-                              cp.arange(6, dtype=cp.int32), indexing='ij')
-        lr = lr.ravel(); lc = lc.ravel()
-        thr = 1e-6 if dtyp == cp.float32 else 1e-12
-        for R_blk, r_list, c_list, v_list in [
-                (R_rpy_blk, rows_mb,  cols_mb,  vals_mb),
-                (R_sup_blk, rows_sup, cols_sup, vals_sup)]:
-            v    = R_blk[:, lr, lc]
-            gr   = (all_idx[:, None] * 6 + lr[None, :]).ravel()
-            gc   = (all_idx[:, None] * 6 + lc[None, :]).ravel()
-            gv   = v.ravel()
-            mask = cp.abs(gv) > thr
-            if mask.any():
-                r_list.append(gr[mask]); c_list.append(gc[mask])
-                v_list.append(gv[mask])
-
-        # ── Pair blocks: hardcoded cutoff = 4.5a ─────────────────────────
+            unit = a
+        N = pos.shape[0]
         if j_gpu is not None:
-            j_g = j_gpu;  k_g = k_gpu;  has_pairs = j_g.size > 0
+            pairs = np.stack([cp.asnumpy(j_gpu), cp.asnumpy(k_gpu)], axis=1)
         else:
-            nb_sizes  = np.array([len(nb) for nb in n_list], dtype=np.int32)
-            has_pairs = nb_sizes.sum() > 0
-            if has_pairs:
-                j_all = np.repeat(np.arange(N, dtype=np.int32), nb_sizes)
-                k_all = np.concatenate([np.asarray(nb, dtype=np.int32)
-                                        for nb in n_list if len(nb) > 0])
-                j_g = cp.asarray(j_all, dtype=cp.int32)
-                k_g = cp.asarray(k_all, dtype=cp.int32)
-
-        if has_pairs:
-            d_g = r_g[j_g] - r_g[k_g]
-            for l in range(3):
-                if pl_np[l] > 0.0:
-                    d_g[:, l] -= cp.round(d_g[:, l] / pl_g[l]) * pl_g[l]
-            r_norms_g = cp.sqrt((d_g * d_g).sum(axis=1))
-            in_cut    = r_norms_g < self._PAIR_CUTOFF
-            if in_cut.any():
-                j_g = j_g[in_cut];  k_g = k_g[in_cut]
-                d_g = d_g[in_cut];  r_norms_g = r_norms_g[in_cut]
-                r_hat_g = -d_g / r_norms_g[:, None]
-
-                for is_sup, cf_g, r_list, c_list, v_list in [
-                        (False, C['_CF_MB'],  rows_mb,  cols_mb,  vals_mb),
-                        (True,  C['_CF_SUP'], rows_sup, cols_sup, vals_sup)]:
-                    sc = _pair_scalars_batch(r_norms_g, self.debye_cut,
-                                            cf_g, is_sup)
-                    pr, pc, pv = _assemble_pair_triplets(
-                        sc, j_g, k_g, n_dof, f0, f1, f2, r_hat_g)
-                    if pr.size > 0:
-                        r_list.append(pr); c_list.append(pc); v_list.append(pv)
-
-        def build_csc(rl, cl, vl):
-            if rl:
-                r = cp.concatenate(rl).astype(cp.int32)
-                c = cp.concatenate(cl).astype(cp.int32)
-                v = cp.concatenate(vl)
-            else:
-                r = cp.empty(0, dtype=cp.int32)
-                c = cp.empty(0, dtype=cp.int32)
-                v = cp.empty(0, dtype=dtyp)
-            return cpsp.coo_matrix((v, (r, c)), shape=(n_dof, n_dof)).tocsc()
-
-        return build_csc(rows_mb, cols_mb, vals_mb), \
-               build_csc(rows_sup, cols_sup, vals_sup)
+            sizes = np.array([len(nb) for nb in n_list], dtype=np.int64)
+            j = np.repeat(np.arange(N), sizes)
+            k = (np.concatenate([np.asarray(nb, dtype=np.int64) for nb in n_list if len(nb)])
+                 if sizes.sum() else np.empty(0, dtype=np.int64))
+            pairs = np.stack([j, k], axis=1)
+        self._asm.set_pattern(BlockPattern(N, pairs))
+        self._asm.assemble(pos, L, length_unit=unit)
+        n = 6 * N
+        ind, ptr = self._asm.indices.copy(), self._asm.indptr.copy()
+        # symmetric => the CSR arrays are also the CSC arrays
+        R_MB = cpsp.csc_matrix((self._asm.vMB.copy(), ind, ptr), shape=(n, n))
+        R_Sup = cpsp.csc_matrix((self._asm.vSS.copy(), ind, ptr), shape=(n, n))
+        return R_MB, R_Sup
