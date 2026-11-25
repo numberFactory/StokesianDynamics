@@ -1,17 +1,9 @@
 """
-lubrication_cupy_fast.py
-------------------------
+lubrication_cupy.py
+-------------------
 Fused GPU assembly of the lubrication resistance matrices.
 
-What it replaces
-~~~~~~~~~~~~~~~~
-``lubrication_cupy.ResistCSC_both`` launches a few hundred small CuPy kernels
-per call, synchronises with the host at every boolean-mask compaction
-(``mask.any()``, ``a[mask]``), materialises (M,12,12) temporaries, then sorts
-COO triplets into CSC; the solver adds ``R_Sup - R_MB`` and ``R_Sup + diag``
-afterwards with cuSPARSE csrgeam (more allocations, more syncs).
-
-Here the sparsity pattern is the 6x6-block pattern {diagonal blocks} U
+The sparsity pattern is the 6x6-block pattern {diagonal blocks} U
 {(i,k), (k,i) : pair (i,k)}.  It is built once per neighbour list, and two
 kernels (one thread per off-diagonal block, one thread per particle) write
 the four matrices the solver needs straight into persistent CSR buffers:
@@ -33,16 +25,13 @@ global matrix.  Columns inside each row are sorted and the matrices are
 exactly symmetric, so the same arrays are also valid CSC arrays.
 
 The kernel arithmetic mirrors ``lubrication.cpp`` operation by operation and
-its coefficient tables are generated from that file (the copies in
-``lubrication_cupy.py`` differ from the C++ in two digits: MB Y11B c3 and MB
-Y11C c4).
+its coefficient tables are generated from that file.
 
 Public API
 ~~~~~~~~~~
 BlockPattern(N, pairs)       host-side block pattern from an upper-triangle pair list
 LubricationAssembler(...)    device buffers + kernels; set_pattern(), assemble(),
                              brownian()
-Lubrication(d_cut)           drop-in for lubrication_cupy.Lubrication (ResistCSC_both)
 KERNEL_SOURCE                the CUDA source (also compiles as C++ for CPU tests)
 """
 import numpy as np
@@ -982,66 +971,3 @@ class LubricationAssembler:
         s = self.xp.tile(self.xp.asarray([self.small_F] * 3 + [self.small_T] * 3,
                                          dtype=self.xp.float64), self.pattern.N)
         return self.R_SupS - self.sparse.diags(s, 0, shape=(n, n), format='csr')
-
-
-# =============================================================================
-# Drop-in replacement for lubrication_cupy.Lubrication
-# =============================================================================
-class Lubrication:
-    """
-    Same call signature as lubrication_cupy.Lubrication.ResistCSC_both, backed
-    by the fused kernels.  Returns fresh (R_MB, R_Sup) cupyx CSC matrices.
-    The fast solver (cupyStokesianDynamics_fast) uses LubricationAssembler
-    directly and avoids the copies made here.
-    """
-    _PAIR_CUTOFF = _PAIR_CUTOFF
-
-    def __init__(self, d_cut, dtype=None):
-        if dtype is not None and np.dtype(dtype) != np.float64:
-            raise ValueError('the fused kernels are float64 only')
-        self.debye_cut = d_cut
-        self._asm = None
-        self._key = None
-
-    def ResistCSC(self, r_vectors, n_list, a, eta, cutoff, wall_cutoff,
-                  periodic_length, Sup_if_true):
-        R_MB, R_Sup = self.ResistCSC_both(r_vectors, n_list, a, eta,
-                                          periodic_length=periodic_length)
-        return R_Sup if Sup_if_true else R_MB
-
-    def ResistCSC_both(self, r_vectors, n_list, a, eta, cutoff=None,
-                       wall_cutoff=None, periodic_length=None,
-                       r_gpu=None, j_gpu=None, k_gpu=None, pl_gpu=None):
-        import cupy as cp
-        import cupyx.scipy.sparse as cpsp
-        if self._asm is None or self._key != (a, eta):
-            self._asm = LubricationAssembler(self.debye_cut, a, eta)
-            self._key = (a, eta)
-        if r_gpu is not None:                 # old fast path: units of a
-            pos = cp.ascontiguousarray(r_gpu, dtype=cp.float64)
-            L = (cp.asnumpy(pl_gpu) if pl_gpu is not None
-                 else np.asarray(periodic_length if periodic_length is not None
-                                 else np.zeros(3), dtype=np.float64))
-            unit = 1.0
-        else:                                 # C++-compatible call: physical units
-            pos = cp.asarray(np.asarray(r_vectors, dtype=np.float64).reshape(-1, 3))
-            L = np.asarray(periodic_length if periodic_length is not None
-                           else np.zeros(3), dtype=np.float64)
-            unit = a
-        N = pos.shape[0]
-        if j_gpu is not None:
-            pairs = np.stack([cp.asnumpy(j_gpu), cp.asnumpy(k_gpu)], axis=1)
-        else:
-            sizes = np.array([len(nb) for nb in n_list], dtype=np.int64)
-            j = np.repeat(np.arange(N), sizes)
-            k = (np.concatenate([np.asarray(nb, dtype=np.int64) for nb in n_list if len(nb)])
-                 if sizes.sum() else np.empty(0, dtype=np.int64))
-            pairs = np.stack([j, k], axis=1)
-        self._asm.set_pattern(BlockPattern(N, pairs))
-        self._asm.assemble(pos, L, length_unit=unit)
-        n = 6 * N
-        ind, ptr = self._asm.indices.copy(), self._asm.indptr.copy()
-        # symmetric => the CSR arrays are also the CSC arrays
-        R_MB = cpsp.csc_matrix((self._asm.vMB.copy(), ind, ptr), shape=(n, n))
-        R_Sup = cpsp.csc_matrix((self._asm.vSS.copy(), ind, ptr), shape=(n, n))
-        return R_MB, R_Sup
