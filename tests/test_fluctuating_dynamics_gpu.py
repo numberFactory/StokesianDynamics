@@ -3,7 +3,7 @@ test_fluctuating_dynamics_gpu.py
 --------------------------------
 GPU version of test_fluctuating_dynamics.py: the same self-contained
 fluctuating Stokesian Dynamics test for N point particles above a single wall
-with periodic boundaries in x and y, run with cupyStokesianDynamics_fast.
+with periodic boundaries in x and y, run with cupyStokesianDynamics.
 
 Forces:
   - Gravity (z direction)
@@ -31,7 +31,7 @@ bottom adds, behind command-line flags:
                solve with each GMRES back end, one deterministic step,
                orientation update, periodic wrap, GPU forces vs numba)
   --profile    per-method times, call counts and device allocations of the
-               new GPU / old GPU / CPU solvers (--solvers new,old,cpu)
+               GPU and CPU solvers (--solvers gpu,cpu)
   --factor-bench  where the factorisation time goes: cuDSS plan / factorize /
                solve for each reordering algorithm and thread count, one plan
                for both matrices, the noise from a backward-only cuDSS solve,
@@ -44,9 +44,9 @@ bottom adds, behind command-line flags:
   python test_fluctuating_dynamics_gpu.py --reference msd_phi0.66_L160x160.npz
   python test_fluctuating_dynamics_gpu.py --L 60 --t-max 50               # quick run
   python test_fluctuating_dynamics_gpu.py --forces cpu                    # numba forces
-  python test_fluctuating_dynamics_gpu.py --profile --no-run --solvers new --gmres-backend scipy_gpu
+  python test_fluctuating_dynamics_gpu.py --profile --no-run --solvers gpu --gmres-backend scipy_gpu
   nsys profile -t cuda,nvtx --stats=true \\
-      python test_fluctuating_dynamics_gpu.py --profile --no-run --solvers new
+      python test_fluctuating_dynamics_gpu.py --profile --no-run --solvers gpu
 """
 
 import sys
@@ -69,7 +69,7 @@ from numba import njit, prange, objmode
 from scipy.spatial.transform import Rotation
 
 from body import Body
-from cupyStokesianDynamics_fast import cupyStokesianDynamics
+from cupyStokesianDynamics import cupyStokesianDynamics
 
 
 # =============================================================================
@@ -652,9 +652,9 @@ def parse_args():
     ap.add_argument('--factor-bench', action='store_true',
                     help='benchmark the factorisation options (cuDSS, CHOLMOD) first')
     ap.add_argument('--no-run', action='store_true', help='skip the diffusion run')
-    ap.add_argument('--solvers', default='new,old,cpu',
-                    help='solvers for --check/--profile: new (cupyStokesianDynamics_fast), '
-                         'old (cupyStokesianDynamics), cpu (pyStokesianDynamics)')
+    ap.add_argument('--solvers', default='gpu,cpu',
+                    help='solvers for --check/--profile: gpu (cupyStokesianDynamics), '
+                         'cpu (pyStokesianDynamics)')
     ap.add_argument('--forces', default='gpu', choices=['gpu', 'cpu'],
                     help='gpu: CUDA kernel with the expressions of _wall_force_numba / '
                          '_pair_force_numba (check C8); cpu: the numba calculator on the host')
@@ -698,6 +698,10 @@ def parse_args():
                     help='MSD npz written by test_fluctuating_dynamics.py to compare with')
     args = ap.parse_args()
     args.solvers = [s.strip() for s in args.solvers.split(',') if s.strip()]
+    unknown = [s for s in args.solvers if s not in SOLVER_NAMES]
+    if unknown:
+        ap.error(f"--solvers: unknown {', '.join(unknown)} (choose from "
+                 f"{', '.join(SOLVER_NAMES)})")
     return args
 
 
@@ -820,14 +824,6 @@ def on_host(calc):
     return host_calc
 
 
-def device_vector(calc):
-    '''... returning a (6N,) device vector (the old GPU solver's convention).'''
-    def dev_calc(*args, **kw):
-        import cupy
-        return cupy.asarray(np.asarray(to_numpy(calc(*args, **kw))).ravel())
-    return dev_calc
-
-
 def gpu_sync():
     try:
         import cupy
@@ -934,7 +930,7 @@ def compare_with_reference(msd_mean, msd_err, lag_times, D_meas, ref_path):
 # =============================================================================
 # Solvers for the checks and the profile
 # =============================================================================
-SOLVER_NAMES = {'new': 'cupyStokesianDynamics_fast', 'old': 'cupyStokesianDynamics',
+SOLVER_NAMES = {'gpu': 'cupyStokesianDynamics', 
                 'cpu': 'pyStokesianDynamics'}
 
 
@@ -944,11 +940,8 @@ def make_solver(kind, setup, tolerance=None, **overrides):
     bodies = [Body(location=np.array(p), orientation=identity_rot) for p in setup['positions']]
     common = dict(bodies=bodies, a=setup['a'], eta=setup['eta'], periodic_length=setup['L'],
                   z_max=setup['z_max'], debye_length=setup['firm_delta'])
-    if kind == 'new':
+    if kind == 'gpu':
         s = cupyStokesianDynamics(**common, **{**setup['solver_options'], **overrides})
-    elif kind == 'old':
-        from cupyStokesianDynamics import cupyStokesianDynamics as OldSolver
-        s = OldSolver(**common)
     elif kind == 'cpu':
         from pyStokesianDynamics import pyStokesianDynamics
         s = pyStokesianDynamics(**common)
@@ -980,13 +973,11 @@ def force_calculator(kind, forces):
         return force_torque_calculator                   # numpy in and out
     if forces == 'gpu':
         return gpu_force_torque_calculator               # device in and out
-    if kind == 'new':
-        return on_host(force_torque_calculator)          # device in, numpy out
-    return device_vector(on_host(force_torque_calculator))
+    return on_host(force_torque_calculator)              # device in, numpy out
 
 
 def solver_positions(kind, s, bodies):
-    return to_numpy(s.positions) if kind == 'new' else np.array([b.location for b in bodies])
+    return to_numpy(s.positions) if kind == 'gpu' else np.array([b.location for b in bodies])
 
 
 # =============================================================================
@@ -1048,19 +1039,15 @@ def _timed(f, *args, **kw):
 
 
 def check_lubrication(rep, setup, args):
-    '''C1: fused GPU assembly vs lubrication.cpp (and vs lubrication_cupy).'''
+    '''C1: fused GPU assembly vs lubrication.cpp.'''
     import cupy
-    from lubrication_cupy_fast import LubricationAssembler, BlockPattern
+    from lubrication_cupy import LubricationAssembler, BlockPattern
     a, eta, debye = setup['a'], setup['eta'], setup['firm_delta']
     try:
         from StokesianDynamics import Lubrication as CppLub
     except Exception as e:
         CppLub = None
         rep.add('C1 lubrication vs C++', 'SKIP', f'StokesianDynamics not importable ({e})')
-    try:
-        from lubrication_cupy import Lubrication as OldLub
-    except Exception:
-        OldLub = None
     syn, L_syn = synthetic_pairs(a)
     for tag, r, L in [('initial configuration', wrap_positions(setup['positions'], setup['L']),
                        setup['L']),
@@ -1070,41 +1057,21 @@ def check_lubrication(rep, setup, args):
         asm.set_pattern(BlockPattern(len(r), pairs))
         r_d = cupy.asarray(r)
         asm.assemble(r_d, L)                               # first call compiles the kernels
-        _, t_new = _timed(asm.assemble, r_d, L)
-        new_mb, new_sup = _host_csc(asm.R_MB), _host_csc(asm.R_SupS)
-        rep.value(f'C1 exact symmetry ({tag})', abs(new_sup - new_sup.T).max() == 0.0, '')
-        nl = _cpp_neighbours(r, L, 4.5 * a)
-        timing = f'fused GPU assembly {1e3*t_new:.2f} ms'
+        _, t_gpu = _timed(asm.assemble, r_d, L)
+        gpu_mb, gpu_sup = _host_csc(asm.R_MB), _host_csc(asm.R_SupS)
+        rep.value(f'C1 exact symmetry ({tag})', abs(gpu_sup - gpu_sup.T).max() == 0.0, '')
+        timing = f'fused GPU assembly {1e3*t_gpu:.2f} ms'
         if CppLub is not None:
+            nl = _cpp_neighbours(r, L, 4.5 * a)
             (ref_mb, ref_sup), t_cpp = _timed(CppLub(debye).ResistCSC_both,
                                               [x for x in r], nl, a, eta, L)
-            for name, A, B in [('R_MB', new_mb, ref_mb), ('R_Sup', new_sup, ref_sup),
-                               ('Delta_R', new_sup - new_mb, ref_sup - ref_mb)]:
+            for name, A, B in [('R_MB', gpu_mb, ref_mb), ('R_Sup', gpu_sup, ref_sup),
+                               ('Delta_R', gpu_sup - gpu_mb, ref_sup - ref_mb)]:
                 D = (A - B).tocoo()
                 err = abs(D.data).max() / abs(B).max() if D.nnz else 0.0
                 rep.value(f'C1 {name} vs lubrication.cpp ({tag})', err < 1e-12,
                           f'max|diff|/max|A| = {err:.2e}')
             timing += f', C++ ResistCSC_both {1e3*t_cpp:.1f} ms'
-        if OldLub is not None:
-            sizes = np.array([len(x) for x in nl])
-            j = np.repeat(np.arange(len(r)), sizes).astype(np.int32)
-            k = (np.concatenate([x for x in nl if len(x)]).astype(np.int32) if sizes.sum()
-                 else np.empty(0, np.int32))
-            try:
-                (o_mb, o_sup), t_old = _timed(
-                    OldLub(debye, dtype=cupy.float64).ResistCSC_both,
-                    list(r), nl, a, eta, periodic_length=L / a, r_gpu=cupy.asarray(r / a),
-                    j_gpu=cupy.asarray(j), k_gpu=cupy.asarray(k), pl_gpu=cupy.asarray(L / a))
-                for name, A, B in [('R_MB', new_mb, o_mb), ('R_Sup', new_sup, o_sup)]:
-                    D = (A - _host_csc(B)).tocoo()
-                    err = abs(D.data).max() / abs(A).max() if D.nnz else 0.0
-                    note = ('  (~5e-9 expected: two MB coefficient digits in lubrication_cupy '
-                            'differ from lubrication.cpp)' if name == 'R_MB' else '')
-                    rep.add(f'C1 {name} vs lubrication_cupy ({tag})', 'INFO',
-                            f'max|diff|/max|A| = {err:.2e}{note}')
-                timing += f', old lubrication_cupy {1e3*t_old:.1f} ms (incl. first-call setup)'
-            except Exception as e:
-                rep.add(f'C1 lubrication_cupy ({tag})', 'SKIP', repr(e))
         rep.add(f'C1 timing ({tag})', 'INFO', timing)
 
 
@@ -1193,10 +1160,10 @@ def _n_plans(s):
 def check_factors(rep, setup, args):
     '''C2: Brownian increments (pairwise: sampled variances and no clipped
     blocks; Cholesky back ends: sampling identity, and for CHOLMOD the explicit
-    factor; again after the particles move, through both code paths; the same
-    measurement on the old GPU solver).  C3: preconditioner residual.'''
+    factor; again after the particles move, through both code paths).
+    C3: preconditioner residual.'''
     import cupy
-    s, _ = make_solver('new', setup)
+    s, _ = make_solver('gpu', setup)
     n = 6 * len(setup['positions'])
     label = _noise_label(s)
     if label == 'pairwise':
@@ -1250,7 +1217,7 @@ def check_factors(rep, setup, args):
     W = np.random.default_rng(1).standard_normal(n)
     for skin, sigma, case in [(0.0, 0.1, 'pair list changed'),
                               (1.0, 0.02, 'lub_skin=1a, pattern kept')]:
-        s, _ = make_solver('new', setup, lub_skin=skin)
+        s, _ = make_solver('gpu', setup, lub_skin=skin)
         s.DR_factor.sample(s.LC, s.r_vecs, s.periodic_length)          # noise at the start
         n0 = _n_plans(s)
         s.Set_R_Mats(cupy.asarray(_moved(setup, sigma)))
@@ -1273,24 +1240,6 @@ def check_factors(rep, setup, args):
                 ok = ok and err < 1e-12
         rep.value(f'C2 Brownian increments after a move ({case}, {label})', ok, detail)
         del s
-    if 'old' in args.solvers:
-        name = 'C2 old solver Brownian factor after a move'
-        try:
-            o, _ = make_solver('old', setup)
-        except Exception as e:
-            rep.add(name, 'SKIP', f'old solver not usable here: {e!r}')
-            return
-        try:
-            o.Set_R_Mats(r_gpu=cupy.asarray(_moved(setup, 0.1)))
-            A = (_host_csc(o.Delta_R) + sp.diags(to_numpy(o.small_diag), 0)).tocsc()
-            rep.add(name, 'INFO', f'||L L^T - P A P^T||/||A|| = '
-                                  f'{_factor_error(o._chol_dr_fac, A):.2e} '
-                                  f'(a valid factor gives ~1e-15)')
-        except Exception as e:
-            if 'cholmod' in (type(e).__module__ + type(e).__name__).lower():
-                rep.add(name, 'INFO', f'CHOLMOD failed on an SPD matrix: {e!r}')
-            else:
-                rep.add(name, 'SKIP', repr(e))
 
 
 CHECK_ITERATIONS = 1000      # GMRES iteration budget of every check solve
@@ -1299,7 +1248,7 @@ CHECK_ITERATIONS = 1000      # GMRES iteration budget of every check solve
 def _check_budget(kind, s):
     '''its_out giving about CHECK_ITERATIONS GMRES iterations: cupyx counts
     iterations, scipy (CPU solver, scipy_gpu, scipy) counts restart cycles.'''
-    if kind == 'new' and s.gmres_backend != 'cupy':
+    if kind == 'gpu' and s.gmres_backend != 'cupy':
         return -(-CHECK_ITERATIONS // s.gmres_restart)
     if kind == 'cpu':
         return -(-CHECK_ITERATIONS // min(300, 6 * len(s.bodies)))
@@ -1337,15 +1286,15 @@ def _counted_solve(s, Xm, its_out):
 
 
 def check_solve_and_step(rep, setup, args):
-    '''C4: one deterministic solve with the new solver (each GMRES back end)
-    and the CPU (and old GPU) solver, at a tolerance the mobility product can
+    '''C4: one deterministic solve with the GPU solver (each GMRES back end)
+    and the CPU solver, at a tolerance the mobility product can
     reach, each limited to about CHECK_ITERATIONS iterations; every solution's
     true residual is evaluated with the GPU operator.  C5: one deterministic
-    trapezoidal step, new vs CPU.'''
+    trapezoidal step, GPU vs CPU.'''
     import cupy
     r0 = setup['positions']
     FT = make_FT_calc(setup, r0)(None, wrap_positions(r0, setup['L'])).ravel()
-    s0, _ = make_solver('new', setup)
+    s0, _ = make_solver('gpu', setup)
     lin, repeat, dtype = mobility_precision(s0)
     floor = max(lin, repeat, np.finfo(np.float64).eps)
     tol = args.check_tol if args.check_tol else max(1e-8, 100.0 * floor)
@@ -1361,9 +1310,10 @@ def check_solve_and_step(rep, setup, args):
         return float(cupy.linalg.norm(s0.IpMDR_Mult(cupy.asarray(u)) - b)) / b_norm
 
     sols, iters = {}, {}
-    cases = [('new', m, dict(gmres_backend=m, gmres_restart=None))
+    cases = [('gpu', m, dict(gmres_backend=m, gmres_restart=None))
              for m in ('cupy', 'scipy_gpu', 'scipy')]
-    cases += [(k, k, {}) for k in ('cpu', 'old') if k in args.solvers]
+    if 'cpu' in args.solvers:
+        cases.append(('cpu', 'cpu', {}))
     for kind, label, kw in cases:
         name = f'C4 solve, {SOLVER_NAMES[kind]} ({label})'
         try:
@@ -1374,7 +1324,7 @@ def check_solve_and_step(rep, setup, args):
             sols[label] = u
             detail = (f'{1e3*dt:.1f} ms, {n_mv} applications of (I + M dR), {n_pc} PC solves, '
                       f'residual {res:.1e} (tol {tol:.0e})')
-            if kind == 'new':
+            if kind == 'gpu':
                 iters[label] = s.gmres_history[-1]['iterations']
                 info = s.gmres_history[-1]['info']
                 rep.value(name, info == 0, detail + ('' if info == 0 else
@@ -1390,34 +1340,31 @@ def check_solve_and_step(rep, setup, args):
         rep.value('C4 scipy_gpu port vs scipy: same iterations',
                   abs(a_ - b_) <= max(1, 0.05 * max(a_, b_)), f'{a_} vs {b_}')
     ref = sols.get('cpu')
-    for label in ('cupy', 'scipy_gpu', 'scipy', 'old'):
+    for label in ('cupy', 'scipy_gpu', 'scipy'):
         if ref is None or label not in sols:
             continue
         err = np.linalg.norm(sols[label] - ref) / np.linalg.norm(ref)
-        if label == 'old':
-            rep.add('C4 solution, old solver vs CPU', 'INFO', f'rel diff {err:.2e}')
-        else:
-            rep.value(f'C4 solution, new ({label}) vs CPU', err < 1e3 * tol, f'rel diff {err:.2e}')
+        rep.value(f'C4 solution, GPU ({label}) vs CPU', err < 1e3 * tol, f'rel diff {err:.2e}')
     s0 = b = None                       # release the reference solver before C5
     free_gpu_memory()
     if 'cpu' in args.solvers:
         moved = {}
-        for kind in ('new', 'cpu'):
+        for kind in ('gpu', 'cpu'):
             s, bodies = make_solver(kind, setup, tolerance=tol)
             _limit_iterations(kind, s)
             FT_calc = make_FT_calc(setup, r0, force_calculator(kind, setup['forces']))
             s.Update_Bodies_Trap(FT_calc, stochastic=False)
             moved[kind] = solver_positions(kind, s, bodies) - r0
             del s
-        err = np.abs(moved['new'] - moved['cpu']).max() / np.abs(moved['cpu']).max()
-        rep.value(f"C5 deterministic step, new ({setup['forces']} forces) vs CPU", err < 1e3 * tol,
-                  f'max|dr_new - dr_cpu| / max|dr_cpu| = {err:.2e}')
+        err = np.abs(moved['gpu'] - moved['cpu']).max() / np.abs(moved['cpu']).max()
+        rep.value(f"C5 deterministic step, GPU ({setup['forces']} forces) vs CPU", err < 1e3 * tol,
+                  f'max|dr_gpu - dr_cpu| / max|dr_cpu| = {err:.2e}')
 
 
 def check_orientation_and_wrap(rep, setup, args):
     '''C6: orientation update vs Body.update.  C7: periodic wrap edge cases.'''
     import cupy
-    from cupyStokesianDynamics_fast import GPUBackend
+    from cupyStokesianDynamics import GPUBackend
     gpu = GPUBackend()
     rng = np.random.default_rng(5)
     n, dt = 16, 0.25
@@ -1529,7 +1476,7 @@ def _reordering_algs():
 def _direct_solver(A, b, handle=None):
     """DirectSolver configured as in cholesky_solver (optionally on a given handle)."""
     import nvmath.sparse.advanced as nvsp
-    from cupyStokesianDynamics_fast import _cudss_threading_lib
+    from cupyStokesianDynamics import _cudss_threading_lib
 
     def make(mtlib):
         opts = dict(sparse_system_type=nvsp.DirectSolverMatrixType.SPD,
@@ -1553,7 +1500,7 @@ def _cudss_case(label, A, alg=None, other=None, noise=False, user_perm=None):
     ordering given to cuDSS instead of its reordering.  Returns cuDSS's
     row permutation.'''
     import cupy
-    from cupyStokesianDynamics_fast import _cudss_backward
+    from cupyStokesianDynamics import _cudss_backward
     n = A.shape[0]
     b = cupy.asarray(np.random.default_rng(8).standard_normal(n))
     A_own = A.copy()
@@ -1690,7 +1637,7 @@ def run_factor_bench(setup, args):
     line is independent; a failing option prints SKIP."""
     print('\n=== factorisation benchmark ===', flush=True)
     import cupy
-    s, _ = make_solver('new', setup)
+    s, _ = make_solver('gpu', setup)
     pattern = s.LC.pattern
     A_pc, A_dr = s.LC.R_SupS.copy(), s.LC.Delta_RS.copy()
     s.Set_R_Mats(cupy.asarray(_moved(setup, 0.1)))      # another sparsity pattern
@@ -1736,7 +1683,7 @@ def run_factor_bench(setup, args):
     print('Cluster preconditioner (pc_backend clusters; no cuDSS), per build / per solve:', flush=True)
     for gap in (0.0, 0.05, 0.1, 0.2):
         try:
-            s3, _ = make_solver('new', setup, pc_backend='clusters', pc_gap=gap)
+            s3, _ = make_solver('gpu', setup, pc_backend='clusters', pc_gap=gap)
             b3 = s3.gpu.xp.asarray(np.random.default_rng(4).standard_normal(6 * len(setup['positions'])))
             s3.PC.factorize(s3.R_Sup, s3.LC.pattern_version)            # warm-up
             s3.PC.solve(b3)
@@ -1750,7 +1697,7 @@ def run_factor_bench(setup, args):
             print(f'  {"clusters gap %.2f" % gap:44s}  SKIP: {_short(e)}', flush=True)
     print('Pairwise Brownian increments (default; no factorisation):', flush=True)
     try:
-        s2, _ = make_solver('new', setup)
+        s2, _ = make_solver('gpu', setup)
         s2.LC.brownian(s2.r_vecs, s2.periodic_length)            # compile
         _, t_pw = _timed(s2.LC.brownian, s2.r_vecs, s2.periodic_length)
         print(f'  {"pairwise":44s}  {1e3*t_pw:.2f} ms per draw, clipped blocks '
@@ -1858,13 +1805,11 @@ class AllocCounter(object):
         return False
 
 
-# solver method -> label (the old GPU solver's *_gpu names share the CPU rows)
+# solver method -> label
 METHODS = {m: m for m in ('Update_Bodies_Trap', 'Set_R_Mats', '_build_neighbour_list',
                           'Lub_Mobility_Root_RHS', 'Lubrication_solve', 'Wall_Mobility_Mult',
                           'IpMDR_Mult', 'IpMDR_PC', 'Check_Update_With_Jump_Trap',
                           'put_r_vecs_in_periodic_box', 'project_to_periodic_image')}
-METHODS.update(put_r_vecs_in_periodic_box_gpu='put_r_vecs_in_periodic_box',
-               project_to_periodic_image_gpu='project_to_periodic_image')
 LUBRICATION = {'assemble': 'lubrication_assembly', 'ResistCSC_both': 'lubrication_assembly',
                'set_pairs': 'lubrication_pattern', 'brownian': 'pairwise noise'}
 MOBILITY = {m: 'libMobility.' + m for m in ('Mdot', 'sqrtMdotW', 'divM', 'setPositions')}
@@ -1900,7 +1845,7 @@ def uninstrument(s, timer):
             setattr(s, attr, object.__getattribute__(v, '_obj'))
 
 
-def new_solver_counters(s):
+def gpu_solver_counters(s):
     extra = {}
     if getattr(s.PC, 'name', '') == 'clusters':
         extra = dict(largest_cluster=s.PC.largest, split_clusters=s.PC.n_split)
@@ -1915,7 +1860,7 @@ def profile_solver(kind, setup, args):
     allocations), then K plain steps for the step time.'''
     print(f'\n--- profiling {SOLVER_NAMES[kind]} ---', flush=True)
     np.random.seed(42)
-    extra = dict(sync_timings=True) if kind == 'new' else {}
+    extra = dict(sync_timings=True) if kind == 'gpu' else {}
     t0 = time.perf_counter()
     s, bodies = make_solver(kind, setup, **extra)
     out = {'solver': SOLVER_NAMES[kind], 'setup_s': time.perf_counter() - t0,
@@ -1936,15 +1881,15 @@ def profile_solver(kind, setup, args):
     if hasattr(s, 'timings'):
         s.timings = {k: 0.0 for k in s.timings}
         s._n_steps_timed = 0
-    if kind == 'new':
+    if kind == 'gpu':
         s.gmres_history.clear()
-        c0 = new_solver_counters(s)
+        c0 = gpu_solver_counters(s)
     K = args.profile_steps
 
     # pass 1: instrumented
     timer = MethodTimer(sync=True)
     instrument(s, timer)
-    if kind in ('new', 'old'):
+    if kind == 'gpu':
         with AllocCounter() as alloc:
             for _ in range(K):
                 step()
@@ -1960,8 +1905,8 @@ def profile_solver(kind, setup, args):
     if hasattr(s, 'timings'):
         out['timings_ms_per_step'] = {k: 1e3 * v / K for k, v in s.timings.items()}
         s.print_timings()
-    if kind == 'new':
-        c1 = new_solver_counters(s)
+    if kind == 'gpu':
+        c1 = gpu_solver_counters(s)
         out['counters_per_step'] = {k: (c1[k] - c0[k]) / K for k in c1
                                     if k not in ('largest_cluster', 'cluster_gap')}
         out['counters_per_step'].update({k: c1[k] for k in ('largest_cluster', 'cluster_gap')
@@ -1985,7 +1930,7 @@ def profile_solver(kind, setup, args):
 
 
 def print_profile_table(results):
-    kinds = [k for k in ('new', 'old', 'cpu') if k in results]
+    kinds = [k for k in ('gpu', 'cpu') if k in results]
     print('\n' + ' ' * 42 + ''.join(f'{SOLVER_NAMES[k]:>28s}' for k in kinds))
 
     def row(label, f):
@@ -1998,8 +1943,8 @@ def print_profile_table(results):
         print(f'{label:42s}' + ''.join(f'{c:>28s}' for c in cells))
 
     row('step time [ms]', lambda r: f"{r['step_ms']:.1f}")
-    if 'new' in kinds:
-        row('step time / new solver', lambda r: f"{r['step_ms'] / results['new']['step_ms']:.1f}x")
+    if 'gpu' in kinds:
+        row('step time / GPU solver', lambda r: f"{r['step_ms'] / results['gpu']['step_ms']:.1f}x")
     for name in ['Set_R_Mats', 'lubrication_assembly', 'lubrication_pattern',
                  '_build_neighbour_list', 'Lub_Mobility_Root_RHS', 'Lubrication_solve',
                  'IpMDR_Mult', 'IpMDR_PC', 'Wall_Mobility_Mult', 'libMobility.Mdot',
@@ -2019,9 +1964,9 @@ def print_profile_table(results):
     row('rejections (wall, jump)', lambda r: f"{r['rejections']}")
     print('(per step; inclusive, synchronised method times; IpMDR_Mult calls = GMRES '
           'applications of I + M dR)')
-    if 'new' in kinds:
-        print('new solver, per step:', ', '.join(
-            f'{k} {v:g}' for k, v in results['new']['counters_per_step'].items()))
+    if 'gpu' in kinds:
+        print('GPU solver, per step:', ', '.join(
+            f'{k} {v:g}' for k, v in results['gpu']['counters_per_step'].items()))
 
 
 def run_profile(setup, args, out_prefix):
